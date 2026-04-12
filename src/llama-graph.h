@@ -676,6 +676,7 @@ public:
     std::map<llama_seq_id, ggml_tensor*> t_candidates;
     std::map<llama_seq_id, ggml_tensor*> t_sampled;
     std::map<llama_seq_id, ggml_tensor*> t_sampled_probs;
+    std::map<int, ggml_tensor*>          t_moe_selected_experts;
 
     std::vector<llm_graph_input_ptr> inputs;
 
