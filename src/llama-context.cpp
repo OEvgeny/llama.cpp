@@ -16,6 +16,10 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <algorithm>
+#include <set>
+#include <sstream>
+#include <string>
 
 //
 // llama_context
@@ -1513,6 +1517,85 @@ static void copy_tensor_async_candidates(
     }
 }
 
+static std::string format_expert_set(const std::vector<int32_t> & set) {
+    std::ostringstream ss;
+    ss << '[';
+    for (size_t i = 0; i < set.size(); ++i) {
+        if (i > 0) {
+            ss << ',';
+        }
+        ss << set[i];
+    }
+    ss << ']';
+    return ss.str();
+}
+
+static void copy_moe_selected_experts(
+    const std::map<int, ggml_tensor *> & tensor_map,
+    std::map<int, std::vector<int32_t>> & dst) {
+    for (const auto & [il, tensor] : tensor_map) {
+        if (!tensor) {
+            continue;
+        }
+
+        const int64_t ne = ggml_nelements(tensor);
+        if (ne <= 0) {
+            dst[il].clear();
+            continue;
+        }
+
+        const size_t element_size = ggml_element_size(tensor);
+        const size_t total_bytes = ggml_nbytes(tensor);
+        GGML_ASSERT(total_bytes == (size_t) ne * element_size);
+        GGML_ASSERT(tensor->type == GGML_TYPE_I32 && "selected experts tensor must be int32");
+
+        auto & out = dst[il];
+        out.resize((size_t) ne);
+
+        const int64_t nrows = ggml_nrows(tensor);
+        const size_t row_size = ggml_row_size(tensor->type, tensor->ne[0]);
+        const size_t stride_tensor = nrows > 1 ? (size_t) tensor->nb[1] : row_size;
+
+        if (nrows <= 1 && ggml_is_contiguous(tensor)) {
+            ggml_backend_tensor_get(tensor, out.data(), 0, total_bytes);
+        } else {
+            for (int64_t i = 0; i < nrows; ++i) {
+                ggml_backend_tensor_get(tensor, (char *) out.data() + (size_t) i * row_size, (size_t) i * stride_tensor, row_size);
+            }
+        }
+    }
+}
+
+static void maybe_log_moe_selected_experts(
+    const llama_ubatch & ubatch,
+    const llm_graph_result * res,
+    std::map<int, std::vector<int32_t>> & host_selected_experts,
+    std::map<int, std::vector<int32_t>> & prev_selected_experts) {
+    if (ubatch.n_tokens != 1 || res->t_moe_selected_experts.empty()) {
+        return;
+    }
+
+    copy_moe_selected_experts(res->t_moe_selected_experts, host_selected_experts);
+
+    for (auto & [il, values] : host_selected_experts) {
+        std::sort(values.begin(), values.end());
+        values.erase(std::unique(values.begin(), values.end()), values.end());
+
+        const auto prev_it = prev_selected_experts.find(il);
+        if (prev_it != prev_selected_experts.end() && prev_it->second == values) {
+            continue;
+        }
+
+        const std::string prev_str = prev_it == prev_selected_experts.end() ? "[]" : format_expert_set(prev_it->second);
+        const std::string curr_str = format_expert_set(values);
+
+        LLAMA_LOG_INFO("%s: moe selected experts layer=%d n_tokens=%u prev=%s curr=%s\n",
+                __func__, il, ubatch.n_tokens, prev_str.c_str(), curr_str.c_str());
+
+        prev_selected_experts[il] = std::move(values);
+    }
+}
+
 static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_seq_id, llama_sampler *> & samplers) {
     for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
         if (!ubatch.output[i]) {
@@ -1726,6 +1809,22 @@ int llama_context::decode(const llama_batch & batch_inp) {
         //if (n_past%100 == 0) {
         //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
         //}
+
+        if (ubatch.n_tokens > 1) {
+            moe_in_prefill = true;
+        } else if (ubatch.n_tokens == 1 && moe_in_prefill) {
+            moe_prev_selected_experts.clear();
+            moe_selected_experts_host.clear();
+            moe_in_prefill = false;
+        }
+
+        ggml_backend_sched_synchronize(sched.get());
+
+        maybe_log_moe_selected_experts(
+                ubatch,
+                res,
+                moe_selected_experts_host,
+                moe_prev_selected_experts);
 
         auto * t_logits = res->get_logits();
         auto * t_embd   = cparams.embeddings ? res->get_embd() : nullptr;
