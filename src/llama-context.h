@@ -335,10 +335,6 @@ private:
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
 
-    std::map<int, std::vector<int32_t>> moe_selected_experts_host;
-    std::map<int, std::vector<int32_t>> moe_prev_selected_experts;
-    bool moe_in_prefill = false;
-
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
 
