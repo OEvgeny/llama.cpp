@@ -159,16 +159,15 @@ public:
 
     void reconfigure(const Config & cfg) {
         cfg_ = cfg;
-        reset();
         slot_to_gid_.assign(std::max(0, cfg_.n_global_slots), -1);
+        reset();
     }
 
     void reset() {
         token_steps_.clear();
         current_step_.clear();
         current_token_index_ = -1;
-        gid_to_slot_.clear();
-        std::fill(slot_to_gid_.begin(), slot_to_gid_.end(), -1);
+        seed_slots();
         gid_last_seen_.clear();
         gid_freq_.clear();
         recent_steps_per_gid_.clear();
@@ -252,6 +251,20 @@ private:
     std::unordered_map<int, std::deque<int>> recent_steps_per_gid_;
     std::unordered_map<int, std::deque<double>> layer_jaccard_hist_;
     std::unordered_map<int, std::vector<int>> layer_prev_selected_;
+
+    void seed_slots() {
+        gid_to_slot_.clear();
+        std::fill(slot_to_gid_.begin(), slot_to_gid_.end(), -1);
+
+        const int total_gids = cfg_.n_layers * cfg_.n_experts_per_layer;
+        const int n_seed = std::min((int) slot_to_gid_.size(), total_gids);
+
+        for (int gid = 0; gid < n_seed; ++gid) {
+            slot_to_gid_[gid] = gid;
+            gid_to_slot_[gid] = gid;
+        }
+    }
+
 
     static double jaccard_sorted(const std::vector<int> & a, const std::vector<int> & b) {
         size_t i = 0, j = 0;
