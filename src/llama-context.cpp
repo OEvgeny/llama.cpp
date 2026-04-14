@@ -10,6 +10,7 @@
 #include "llama-model.h"
 #include "llama-ext.h"
 #include "llama.h"
+#include "llama_moe_slot_planner.h"
 
 #include <cinttypes>
 #include <cmath>
@@ -33,6 +34,8 @@
 std::map<int, std::vector<int32_t>> moe_selected_experts_host;
 std::map<int, std::vector<int32_t>> moe_prev_selected_experts;
 bool moe_in_prefill = false;
+llama_moe_plan::SlotPlanner moe_slot_planner;
+int64_t moe_planner_token_index = 0;
 
 static std::string format_expert_set(const std::vector<int32_t> & set) {
     std::ostringstream ss;
@@ -96,6 +99,7 @@ static void copy_i32_tensor_to_host(const ggml_tensor * t, std::vector<int32_t> 
 
 struct llama_moe_eval_ctx {
     const llama_ubatch * ubatch = nullptr;
+    size_t observed_layers_this_step = 0;
     std::map<int, std::vector<int32_t>> * host_selected_experts = nullptr;
     std::map<int, std::vector<int32_t>> * prev_selected_experts = nullptr;
 };
@@ -131,6 +135,9 @@ static bool moe_selected_experts_eval_cb(struct ggml_tensor * t, bool ask, void 
     std::vector<int32_t> values = raw;
     std::sort(values.begin(), values.end());
     values.erase(std::unique(values.begin(), values.end()), values.end());
+
+    ctx->observed_layers_this_step++;
+    moe_slot_planner.observe_layer(il, values);
 
     const auto prev_it = ctx->prev_selected_experts->find(il);
     if (prev_it != ctx->prev_selected_experts->end() && prev_it->second == values) {
@@ -1818,10 +1825,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
         ggml_status status;
 
         if (ubatch.n_tokens > 1) {
+            if (!moe_in_prefill) {
+                moe_slot_planner.reset();
+                moe_planner_token_index = 0;
+            }
             moe_in_prefill = true;
         } else if (ubatch.n_tokens == 1 && moe_in_prefill) {
             moe_prev_selected_experts.clear();
             moe_selected_experts_host.clear();
+            moe_slot_planner.reset();
+            moe_planner_token_index = 0;
             moe_in_prefill = false;
         }
 
@@ -1832,12 +1845,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
         };
 
         if (ubatch.n_tokens == 1) {
+            moe_slot_planner.begin_decode_step(static_cast<int>(moe_planner_token_index++));
             ggml_backend_sched_set_eval_callback(sched.get(), moe_selected_experts_eval_cb, &moe_eval_ctx);
         } else {
             ggml_backend_sched_set_eval_callback(sched.get(), nullptr, nullptr);
         }
 
         const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_DECODER, mctx.get(), status);
+
+        if (ubatch.n_tokens == 1) {
+            LLAMA_LOG_INFO("%s: observed_layers_this_step=%zu\n", __func__, moe_eval_ctx.observed_layers_this_step);
+            auto plan = moe_slot_planner.finish_decode_step_and_get_plan();
+            LLAMA_LOG_INFO("%s: moe slot planner plan:\n%s\n", __func__, plan.debug_string().c_str());
+        }
 
         // always clear after the compute so later paths do not inherit it
         ggml_backend_sched_set_eval_callback(sched.get(), nullptr, nullptr);
