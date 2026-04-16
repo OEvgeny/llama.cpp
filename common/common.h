@@ -379,6 +379,22 @@ struct common_params_diffusion {
     bool    add_gumbel_noise = false; // add gumbel noise to the logits if temp > 0.0
 };
 
+enum common_moe_slot_bootstrap {
+    COMMON_MOE_SLOT_BOOTSTRAP_SEED,
+    COMMON_MOE_SLOT_BOOTSTRAP_EMPTY,
+};
+
+enum common_moe_slot_prefill {
+    COMMON_MOE_SLOT_PREFILL_FREEZE,
+    COMMON_MOE_SLOT_PREFILL_OBSERVE,
+};
+
+enum common_moe_slot_log {
+    COMMON_MOE_SLOT_LOG_OFF,
+    COMMON_MOE_SLOT_LOG_PLAN,
+    COMMON_MOE_SLOT_LOG_VERBOSE,
+};
+
 // reasoning API response format (not to be confused as chat template's reasoning format)
 // only used by server
 enum common_reasoning_format {
@@ -484,6 +500,18 @@ struct common_params {
     std::vector<std::string> antiprompt; // strings upon which more user input is prompted (a.k.a. reverse prompts)
     std::vector<llama_model_kv_override> kv_overrides;
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
+
+    int32_t moe_slot_count               = 0;
+    int32_t moe_slot_moves               = 1;
+    int32_t moe_slot_window              = 32;
+    int32_t moe_slot_stability_window    = 32;
+    float   moe_slot_stability_threshold = 0.30f;
+    int32_t moe_slot_protect_recent      = 2;
+    enum common_moe_slot_bootstrap moe_slot_bootstrap = COMMON_MOE_SLOT_BOOTSTRAP_SEED;
+    enum common_moe_slot_prefill   moe_slot_prefill   = COMMON_MOE_SLOT_PREFILL_FREEZE;
+    enum common_moe_slot_log       moe_slot_log       = COMMON_MOE_SLOT_LOG_OFF;
+    bool moe_cpu_moe_enabled = false;
+    bool moe_n_cpu_moe_enabled = false;
 
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
     std::vector<common_adapter_lora_info> lora_adapters; // lora adapter path with user defined scale

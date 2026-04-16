@@ -621,6 +621,13 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         params.kv_overrides.back().key[0] = 0;
     }
 
+    if (params.moe_slot_count > 0) {
+        if (params.moe_cpu_moe_enabled || params.moe_n_cpu_moe_enabled) {
+            throw std::invalid_argument("error: --moe-slot-count cannot be combined with --cpu-moe or --n-cpu-moe\n");
+        }
+        params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
+    }
+
     // pad tensor_buft_overrides for llama_params_fit:
     const size_t ntbo = llama_max_tensor_buft_overrides();
     while (params.tensor_buft_overrides.size() < ntbo) {
@@ -2292,6 +2299,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"-cmoe", "--cpu-moe"},
         "keep all Mixture of Experts (MoE) weights in the CPU",
         [](common_params & params) {
+            params.moe_cpu_moe_enabled = true;
             params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
         }
     ).set_env("LLAMA_ARG_CPU_MOE"));
@@ -2302,6 +2310,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             if (value < 0) {
                 throw std::invalid_argument("invalid value");
             }
+            params.moe_n_cpu_moe_enabled = true;
             for (int i = 0; i < value; ++i) {
                 // keep strings alive and avoid leaking memory by storing them in a static vector
                 static std::list<std::string> buft_overrides;
@@ -2310,6 +2319,108 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
+    add_opt(common_arg(
+        {"--moe-slot-count"}, "N",
+        "number of GPU expert slots to allocate for MoE slot cache (0 = disabled)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_slot_count = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_SLOT_COUNT"));
+    add_opt(common_arg(
+        {"--moe-slot-moves"}, "N",
+        "max expert promotions/evictions per decode token for MoE slot cache",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_slot_moves = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_SLOT_MOVES"));
+    add_opt(common_arg(
+        {"--moe-slot-bootstrap"}, "{seed,empty}",
+        "startup policy for MoE slot cache",
+        [](common_params & params, const std::string & value) {
+            if (value == "seed") {
+                params.moe_slot_bootstrap = COMMON_MOE_SLOT_BOOTSTRAP_SEED;
+            } else if (value == "empty") {
+                params.moe_slot_bootstrap = COMMON_MOE_SLOT_BOOTSTRAP_EMPTY;
+            } else {
+                throw std::invalid_argument("invalid value");
+            }
+        }
+    ).set_env("LLAMA_ARG_MOE_SLOT_BOOTSTRAP"));
+    add_opt(common_arg(
+        {"--moe-slot-window"}, "N",
+        "rolling hotness window for MoE slot planner",
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_slot_window = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_SLOT_WINDOW"));
+    add_opt(common_arg(
+        {"--moe-slot-stability-window"}, "N",
+        "per-layer stability window for MoE slot planner",
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_slot_stability_window = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_SLOT_STABILITY_WINDOW"));
+    add_opt(common_arg(
+        {"--moe-slot-stability-threshold"}, "F",
+        "minimum layer stability for MoE slot planner promotions",
+        [](common_params & params, const std::string & value) {
+            const float threshold = std::stof(value);
+            if (threshold < 0.0f || threshold > 1.0f) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_slot_stability_threshold = threshold;
+        }
+    ).set_env("LLAMA_ARG_MOE_SLOT_STABILITY_THRESHOLD"));
+    add_opt(common_arg(
+        {"--moe-slot-protect-recent"}, "N",
+        "protect experts seen in the last N decode steps from eviction",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_slot_protect_recent = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_SLOT_PROTECT_RECENT"));
+    add_opt(common_arg(
+        {"--moe-slot-prefill"}, "{freeze,observe}",
+        "prefill policy for MoE slot planner",
+        [](common_params & params, const std::string & value) {
+            if (value == "freeze") {
+                params.moe_slot_prefill = COMMON_MOE_SLOT_PREFILL_FREEZE;
+            } else if (value == "observe") {
+                params.moe_slot_prefill = COMMON_MOE_SLOT_PREFILL_OBSERVE;
+            } else {
+                throw std::invalid_argument("invalid value");
+            }
+        }
+    ).set_env("LLAMA_ARG_MOE_SLOT_PREFILL"));
+    add_opt(common_arg(
+        {"--moe-slot-log"}, "{off,plan,verbose}",
+        "logging mode for MoE slot planner",
+        [](common_params & params, const std::string & value) {
+            if (value == "off") {
+                params.moe_slot_log = COMMON_MOE_SLOT_LOG_OFF;
+            } else if (value == "plan") {
+                params.moe_slot_log = COMMON_MOE_SLOT_LOG_PLAN;
+            } else if (value == "verbose") {
+                params.moe_slot_log = COMMON_MOE_SLOT_LOG_VERBOSE;
+            } else {
+                throw std::invalid_argument("invalid value");
+            }
+        }
+    ).set_env("LLAMA_ARG_MOE_SLOT_LOG"));
     add_opt(common_arg(
         {"-cmoed", "--cpu-moe-draft"},
         "keep all Mixture of Experts (MoE) weights in the CPU for the draft model",
