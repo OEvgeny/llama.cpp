@@ -35,7 +35,7 @@ void llama_context::moe_slot_runtime_state::reset_runtime_maps(int32_t n_layer, 
     n_expert_per_layer = std::max(0, n_expert);
     gid_to_slot.clear();
     slot_to_gid.assign(std::max(0, slot_count), -1);
-    slot_ready.assign(slot_to_gid.size(), 0);
+    slot_state.assign(slot_to_gid.size(), SLOT_EMPTY);
     expert_to_slot.assign(std::max(0, n_layer), std::vector<int>(std::max(0, n_expert), -1));
 
     if (seed) {
@@ -46,7 +46,7 @@ void llama_context::moe_slot_runtime_state::reset_runtime_maps(int32_t n_layer, 
             const int il = n_expert > 0 ? gid / n_expert : 0;
             const int ie = n_expert > 0 ? gid % n_expert : 0;
             slot_to_gid[slot] = gid;
-            slot_ready[slot] = 1;
+            slot_state[slot] = SLOT_READY;
             gid_to_slot[gid] = slot;
             if (il >= 0 && il < (int) expert_to_slot.size() && ie >= 0 && ie < (int) expert_to_slot[il].size()) {
                 expert_to_slot[il][ie] = slot;
@@ -109,11 +109,56 @@ static int32_t moe_family_id_from_name(const char * family) {
 static size_t moe_count_pending_slots(const llama_context::moe_slot_runtime_state & rt) {
     size_t pending = 0;
     for (size_t i = 0; i < rt.slot_to_gid.size(); ++i) {
-        if (rt.slot_to_gid[i] >= 0 && rt.slot_ready[i] == 0) {
+        if (rt.slot_to_gid[i] >= 0 && rt.slot_state[i] == llama_context::moe_slot_runtime_state::SLOT_PENDING_FILL) {
             pending++;
         }
     }
     return pending;
+}
+
+static bool moe_slot_is_ready(const llama_context::moe_slot_runtime_state & rt, int slot) {
+    return slot >= 0 && slot < (int) rt.slot_state.size() && rt.slot_state[slot] == llama_context::moe_slot_runtime_state::SLOT_READY;
+}
+
+static void moe_assert_slot_map_consistency(
+        const llama_context::moe_slot_runtime_state & rt,
+        int32_t planner_token_index,
+        int il,
+        const char * when) {
+    for (size_t slot = 0; slot < rt.slot_to_gid.size(); ++slot) {
+        const int gid = rt.slot_to_gid[slot];
+        if (gid < 0) {
+            GGML_ASSERT(rt.slot_state[slot] == llama_context::moe_slot_runtime_state::SLOT_EMPTY);
+            continue;
+        }
+
+        const auto it = rt.gid_to_slot.find(gid);
+        if (!(it != rt.gid_to_slot.end() && it->second == (int) slot)) {
+            GGML_ABORT("moe slot invariant failed (%s): token=%d layer=%d gid_to_slot mismatch gid=%d slot=%d",
+                when, planner_token_index, il, gid, (int) slot);
+        }
+
+        if (rt.n_expert_per_layer > 0) {
+            const int layer = gid / rt.n_expert_per_layer;
+            const int expert = gid % rt.n_expert_per_layer;
+            if (layer >= 0 && layer < (int) rt.expert_to_slot.size() &&
+                expert >= 0 && expert < (int) rt.expert_to_slot[layer].size()) {
+                if (rt.expert_to_slot[layer][expert] != (int) slot) {
+                    GGML_ABORT("moe slot invariant failed (%s): token=%d layer=%d expert_to_slot mismatch gid=%d expected_slot=%d found_slot=%d",
+                        when, planner_token_index, il, gid, (int) slot, rt.expert_to_slot[layer][expert]);
+                }
+            }
+        }
+    }
+
+    for (const auto & kv : rt.gid_to_slot) {
+        const int gid = kv.first;
+        const int slot = kv.second;
+        if (!(slot >= 0 && slot < (int) rt.slot_to_gid.size() && rt.slot_to_gid[slot] == gid)) {
+            GGML_ABORT("moe slot invariant failed (%s): token=%d layer=%d slot_to_gid mismatch gid=%d slot=%d",
+                when, planner_token_index, il, gid, slot);
+        }
+    }
 }
 
 static void moe_record_layer_hit_window(
@@ -497,8 +542,8 @@ static void apply_moe_slot_plan(
         }
 
         const int old_gid = rt.slot_to_gid[fill.slot];
-        const uint8_t old_ready = rt.slot_ready[fill.slot];
-        rt.slot_ready[fill.slot] = 0; // pending copy
+        const llama_context::moe_slot_runtime_state::slot_readiness old_state = rt.slot_state[fill.slot];
+        rt.slot_state[fill.slot] = llama_context::moe_slot_runtime_state::SLOT_PENDING_FILL;
 
         if (old_gid >= 0) {
             rt.gid_to_slot.erase(old_gid);
@@ -550,7 +595,7 @@ static void apply_moe_slot_plan(
         }
 
         if (copy_ok) {
-            rt.slot_ready[fill.slot] = 1;
+            rt.slot_state[fill.slot] = llama_context::moe_slot_runtime_state::SLOT_READY;
             rt.token_counters.copy_bytes += bytes_copied;
         } else {
             rt.token_counters.copy_failures++;
@@ -563,10 +608,10 @@ static void apply_moe_slot_plan(
                 if (old_layer >= 0 && old_layer < (int) rt.expert_to_slot.size() && old_expert >= 0 && old_expert < (int) rt.expert_to_slot[old_layer].size()) {
                     rt.expert_to_slot[old_layer][old_expert] = fill.slot;
                 }
-                rt.slot_ready[fill.slot] = old_ready;
+                rt.slot_state[fill.slot] = old_state;
             } else {
                 rt.slot_to_gid[fill.slot] = -1;
-                rt.slot_ready[fill.slot] = 0;
+                rt.slot_state[fill.slot] = llama_context::moe_slot_runtime_state::SLOT_EMPTY;
                 rt.gid_to_slot.erase(fill.gid);
                 if (fill.layer >= 0 && fill.layer < (int) rt.expert_to_slot.size() && fill.expert >= 0 && fill.expert < (int) rt.expert_to_slot[fill.layer].size()) {
                     rt.expert_to_slot[fill.layer][fill.expert] = -1;
@@ -589,6 +634,12 @@ static void update_moe_layer_routing_counters(
         if (il < 0 || il >= (int) rt.expert_to_slot.size()) {
             continue;
         }
+
+        if (rt.planner_log >= 2) {
+            moe_assert_slot_map_consistency(rt, (int32_t) rt.planner_token_index, il, "pre-route");
+        }
+
+        std::unordered_map<int, int32_t> slot_to_expert;
         bool all_ready = true;
         for (int32_t e : kv.second) {
             if (e < 0 || e >= (int) rt.expert_to_slot[il].size()) {
@@ -596,12 +647,23 @@ static void update_moe_layer_routing_counters(
                 break;
             }
             const int slot = rt.expert_to_slot[il][e];
-            if (slot < 0 || slot >= (int) rt.slot_ready.size() || rt.slot_ready[slot] == 0) {
+            if (slot >= 0) {
+                const auto ins = slot_to_expert.emplace(slot, e);
+                if (!ins.second && ins.first->second != e && rt.planner_log >= 2) {
+                    GGML_ABORT("moe slot invariant failed (selected-map): token=%d layer=%d slot=%d experts=(%d,%d)",
+                        (int32_t) rt.planner_token_index, il, slot, ins.first->second, e);
+                }
+            }
+            if (!moe_slot_is_ready(rt, slot)) {
                 all_ready = false;
                 break;
             }
         }
-        if (all_ready) {
+
+        const bool route_gpu_hit = all_ready;
+        const bool route_cpu_fallback = !all_ready;
+        GGML_ASSERT(route_gpu_hit != route_cpu_fallback);
+        if (route_gpu_hit) {
             rt.token_counters.gpu_hit_layers++;
             if (il < (int) rt.layer_gpu_hit.size()) {
                 rt.layer_gpu_hit[il]++;
@@ -613,6 +675,10 @@ static void update_moe_layer_routing_counters(
                 rt.layer_cpu_fallback[il]++;
             }
             moe_record_layer_hit_window(rt, il, false);
+        }
+
+        if (rt.planner_log >= 2) {
+            moe_assert_slot_map_consistency(rt, (int32_t) rt.planner_token_index, il, "post-route");
         }
     }
 }

@@ -1241,7 +1241,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * gate_up_exps,
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
-         ggml_tensor * down_exps_s) const {
+         ggml_tensor * down_exps_s,
+         ggml_tensor * expert_to_slot,
+         ggml_tensor * slot_up_exps,
+         ggml_tensor * slot_gate_exps,
+         ggml_tensor * slot_gate_up_exps,
+         ggml_tensor * slot_down_exps) const {
     return build_moe_ffn(
         cur,
         gate_inp,  /* gate_inp_b  */ nullptr,
@@ -1261,7 +1266,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         /* gate_up_exps_b */ nullptr,
         up_exps_s,
         gate_exps_s,
-        down_exps_s
+        down_exps_s,
+        expert_to_slot,
+        slot_up_exps,
+        slot_gate_exps,
+        slot_gate_up_exps,
+        slot_down_exps
     );
 }
 
@@ -1288,7 +1298,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * gate_up_exps_b,
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
-         ggml_tensor * down_exps_s) const {
+         ggml_tensor * down_exps_s,
+         ggml_tensor * expert_to_slot,
+         ggml_tensor * slot_up_exps,
+         ggml_tensor * slot_gate_exps,
+         ggml_tensor * slot_gate_up_exps,
+         ggml_tensor * slot_down_exps) const {
+    (void) expert_to_slot;
+    (void) slot_up_exps;
+    (void) slot_gate_exps;
+    (void) slot_gate_up_exps;
+    (void) slot_down_exps;
+
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN

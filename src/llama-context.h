@@ -11,6 +11,7 @@
 #include "ggml-opt.h"
 
 #include <array>
+#include <cstdint>
 #include <map>
 #include <string>
 #include <unordered_map>
@@ -48,6 +49,12 @@ struct llama_context {
     };
 
     struct moe_slot_runtime_state {
+        enum slot_readiness : uint8_t {
+            SLOT_EMPTY = 0,
+            SLOT_PENDING_FILL = 1,
+            SLOT_READY = 2,
+        };
+
         enum moe_tensor_family : int32_t {
             MOE_FAMILY_UP_EXPS = 0,
             MOE_FAMILY_DOWN_EXPS,
@@ -90,7 +97,7 @@ struct llama_context {
         std::unordered_map<int, int> gid_to_slot;
         std::vector<int> slot_to_gid;
         std::vector<std::vector<int>> expert_to_slot;
-        std::vector<uint8_t> slot_ready; // 0 = pending/empty, 1 = ready
+        std::vector<slot_readiness> slot_state;
 
         std::vector<int64_t> layer_gpu_hit;
         std::vector<int64_t> layer_cpu_fallback;
