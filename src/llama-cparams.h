@@ -26,6 +26,16 @@ struct llama_cparams {
     float yarn_beta_fast;
     float yarn_beta_slow;
 
+    int32_t moe_slot_count;
+    int32_t moe_slot_moves;
+    int32_t moe_slot_window;
+    int32_t moe_slot_stability_window;
+    float   moe_slot_stability_threshold;
+    int32_t moe_slot_protect_recent;
+    int32_t moe_slot_bootstrap;
+    int32_t moe_slot_prefill;
+    int32_t moe_slot_log;
+
     bool embeddings;
     bool causal_attn;
     bool offload_kqv;

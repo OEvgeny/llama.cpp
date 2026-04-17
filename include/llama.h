@@ -351,6 +351,17 @@ extern "C" {
         uint32_t yarn_orig_ctx;    // YaRN original context size
         float    defrag_thold;     // [DEPRECATED] defragment the KV cache if holes/size > thold, <= 0 disabled (default)
 
+        // MoE slot planner controls [EXPERIMENTAL]
+        int32_t moe_slot_count;               // 0 = disabled
+        int32_t moe_slot_moves;               // max promotions/evictions per decode token
+        int32_t moe_slot_window;              // rolling hotness window
+        int32_t moe_slot_stability_window;    // per-layer stability rolling window
+        float   moe_slot_stability_threshold; // minimum layer stability to spend moves there
+        int32_t moe_slot_protect_recent;      // avoid evicting experts seen in last N decode steps
+        int32_t moe_slot_bootstrap;           // 0 = seed, 1 = empty
+        int32_t moe_slot_prefill;             // 0 = freeze, 1 = observe
+        int32_t moe_slot_log;                 // 0 = off, 1 = plan, 2 = verbose
+
         ggml_backend_sched_eval_callback cb_eval;
         void * cb_eval_user_data;
 

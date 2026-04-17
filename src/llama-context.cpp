@@ -36,6 +36,8 @@ std::map<int, std::vector<int32_t>> moe_prev_selected_experts;
 bool moe_in_prefill = false;
 llama_moe_plan::SlotPlanner moe_slot_planner;
 int64_t moe_planner_token_index = 0;
+bool moe_slot_planner_enabled = false;
+int32_t moe_slot_planner_log = 0;
 
 static std::string format_expert_set(const std::vector<int32_t> & set) {
     std::ostringstream ss;
@@ -55,6 +57,51 @@ static bool is_moe_topk_tensor(const ggml_tensor * t) {
         return false;
     }
     return std::strncmp(t->name, "ffn_moe_topk-", 13) == 0;
+}
+
+static void configure_moe_slot_planner(const llama_hparams & hparams, const llama_cparams & cparams) {
+    moe_slot_planner_enabled = cparams.moe_slot_count > 0 && hparams.n_expert > 0 && hparams.n_expert_used > 0;
+    moe_slot_planner_log = cparams.moe_slot_log;
+
+    moe_selected_experts_host.clear();
+    moe_prev_selected_experts.clear();
+    moe_in_prefill = false;
+    moe_planner_token_index = 0;
+
+    if (!moe_slot_planner_enabled) {
+        moe_slot_planner.reset();
+        return;
+    }
+
+    auto cfg = llama_moe_plan::make_model_shaped_config(
+        static_cast<int>(hparams.n_layer),
+        static_cast<int>(hparams.n_expert),
+        static_cast<int>(hparams.n_expert_used),
+        cparams.moe_slot_count,
+        cparams.moe_slot_moves);
+
+    cfg.hot_window = cparams.moe_slot_window;
+    cfg.stability_window = cparams.moe_slot_stability_window;
+    cfg.stability_threshold = cparams.moe_slot_stability_threshold;
+    cfg.protect_recent_steps = cparams.moe_slot_protect_recent;
+
+    moe_slot_planner.reconfigure(cfg);
+
+    if (cparams.moe_slot_bootstrap == 1) {
+        moe_slot_planner.clear_slots();
+    }
+
+    LLAMA_LOG_INFO(
+        "%s: enabled n_layers=%d n_expert=%d top_k=%d slots=%d moves=%d bootstrap=%s prefill=%s log=%d\n",
+        __func__,
+        cfg.n_layers,
+        cfg.n_experts_per_layer,
+        cfg.top_k,
+        cfg.n_global_slots,
+        cfg.max_fills_per_token,
+        cparams.moe_slot_bootstrap == 0 ? "seed" : "empty",
+        cparams.moe_slot_prefill == 0 ? "freeze" : "observe",
+        cparams.moe_slot_log);
 }
 
 static int parse_moe_layer_from_name(const char * name) {
@@ -110,11 +157,6 @@ static bool moe_selected_experts_eval_cb(struct ggml_tensor * t, bool ask, void 
         return true;
     }
 
-    // decode-only
-    if (ctx->ubatch->n_tokens != 1) {
-        return false;
-    }
-
     if (!is_moe_topk_tensor(t)) {
         return false;
     }
@@ -148,8 +190,10 @@ static bool moe_selected_experts_eval_cb(struct ggml_tensor * t, bool ask, void 
         prev_it == ctx->prev_selected_experts->end() ? "[]" : format_expert_set(prev_it->second);
     const std::string curr_str = format_expert_set(values);
 
-    LLAMA_LOG_INFO("%s: moe selected experts layer=%d n_tokens=%u prev=%s curr=%s\n",
-        __func__, il, ctx->ubatch->n_tokens, prev_str.c_str(), curr_str.c_str());
+    if (moe_slot_planner_log >= 2) {
+        LLAMA_LOG_INFO("%s: moe selected experts layer=%d n_tokens=%u prev=%s curr=%s\n",
+            __func__, il, ctx->ubatch->n_tokens, prev_str.c_str(), curr_str.c_str());
+    }
 
     (*ctx->prev_selected_experts)[il] = std::move(values);
     return true;
@@ -187,6 +231,15 @@ llama_context::llama_context(
     cparams.no_perf          = params.no_perf;
     cparams.pooling_type     = params.pooling_type;
     cparams.warmup           = false;
+    cparams.moe_slot_count               = params.moe_slot_count;
+    cparams.moe_slot_moves               = params.moe_slot_moves;
+    cparams.moe_slot_window              = params.moe_slot_window;
+    cparams.moe_slot_stability_window    = params.moe_slot_stability_window;
+    cparams.moe_slot_stability_threshold = params.moe_slot_stability_threshold;
+    cparams.moe_slot_protect_recent      = params.moe_slot_protect_recent;
+    cparams.moe_slot_bootstrap           = params.moe_slot_bootstrap;
+    cparams.moe_slot_prefill             = params.moe_slot_prefill;
+    cparams.moe_slot_log                 = params.moe_slot_log;
 
     cparams.n_ctx            = params.n_ctx           == 0    ? hparams.n_ctx_train           : params.n_ctx;
     cparams.rope_freq_base   = params.rope_freq_base  == 0.0f ? hparams.rope_freq_base_train  : params.rope_freq_base;
@@ -301,6 +354,8 @@ llama_context::llama_context(
 
     // initialized later
     cparams.pipeline_parallel = false;
+
+    configure_moe_slot_planner(hparams, cparams);
 
     {
         const char * LLAMA_GRAPH_REUSE_DISABLE = getenv("LLAMA_GRAPH_REUSE_DISABLE");
@@ -1824,18 +1879,20 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         ggml_status status;
 
-        if (ubatch.n_tokens > 1) {
-            if (!moe_in_prefill) {
+        if (moe_slot_planner_enabled) {
+            if (ubatch.n_tokens > 1) {
+                if (!moe_in_prefill) {
+                    moe_slot_planner.reset();
+                    moe_planner_token_index = 0;
+                }
+                moe_in_prefill = true;
+            } else if (ubatch.n_tokens == 1 && moe_in_prefill) {
+                moe_prev_selected_experts.clear();
+                moe_selected_experts_host.clear();
                 moe_slot_planner.reset();
                 moe_planner_token_index = 0;
+                moe_in_prefill = false;
             }
-            moe_in_prefill = true;
-        } else if (ubatch.n_tokens == 1 && moe_in_prefill) {
-            moe_prev_selected_experts.clear();
-            moe_selected_experts_host.clear();
-            moe_slot_planner.reset();
-            moe_planner_token_index = 0;
-            moe_in_prefill = false;
         }
 
         llama_moe_eval_ctx moe_eval_ctx = {
@@ -1844,7 +1901,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
             .prev_selected_experts = &moe_prev_selected_experts,
         };
 
-        if (ubatch.n_tokens == 1) {
+        const bool planner_active_step = moe_slot_planner_enabled &&
+            (ubatch.n_tokens == 1 || (ubatch.n_tokens > 1 && cparams.moe_slot_prefill == 1));
+
+        if (planner_active_step) {
             moe_slot_planner.begin_decode_step(static_cast<int>(moe_planner_token_index++));
             ggml_backend_sched_set_eval_callback(sched.get(), moe_selected_experts_eval_cb, &moe_eval_ctx);
         } else {
@@ -1853,10 +1913,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_DECODER, mctx.get(), status);
 
-        if (ubatch.n_tokens == 1) {
-            LLAMA_LOG_INFO("%s: observed_layers_this_step=%zu\n", __func__, moe_eval_ctx.observed_layers_this_step);
+        if (planner_active_step) {
             auto plan = moe_slot_planner.finish_decode_step_and_get_plan();
-            LLAMA_LOG_INFO("%s: moe slot planner plan:\n%s\n", __func__, plan.debug_string().c_str());
+
+            if (moe_slot_planner_log >= 2) {
+                LLAMA_LOG_INFO("%s: observed_layers_this_step=%zu\n", __func__, moe_eval_ctx.observed_layers_this_step);
+            }
+
+            if (moe_slot_planner_log >= 1) {
+                LLAMA_LOG_INFO("%s: moe slot planner plan:\n%s\n", __func__, plan.debug_string().c_str());
+            }
         }
 
         // always clear after the compute so later paths do not inherit it
@@ -3075,6 +3141,15 @@ llama_context_params llama_context_default_params() {
         /*.yarn_beta_slow              =*/ -1.0f,
         /*.yarn_orig_ctx               =*/ 0,
         /*.defrag_thold                =*/ -1.0f,
+        /*.moe_slot_count              =*/ 0,
+        /*.moe_slot_moves              =*/ 1,
+        /*.moe_slot_window             =*/ 32,
+        /*.moe_slot_stability_window   =*/ 32,
+        /*.moe_slot_stability_threshold=*/ 0.30f,
+        /*.moe_slot_protect_recent     =*/ 2,
+        /*.moe_slot_bootstrap          =*/ 0,
+        /*.moe_slot_prefill            =*/ 0,
+        /*.moe_slot_log                =*/ 0,
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,

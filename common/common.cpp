@@ -1476,6 +1476,15 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
+    cparams.moe_slot_count               = params.moe_slot_count;
+    cparams.moe_slot_moves               = params.moe_slot_moves;
+    cparams.moe_slot_window              = params.moe_slot_window;
+    cparams.moe_slot_stability_window    = params.moe_slot_stability_window;
+    cparams.moe_slot_stability_threshold = params.moe_slot_stability_threshold;
+    cparams.moe_slot_protect_recent      = params.moe_slot_protect_recent;
+    cparams.moe_slot_bootstrap           = static_cast<int32_t>(params.moe_slot_bootstrap);
+    cparams.moe_slot_prefill             = static_cast<int32_t>(params.moe_slot_prefill);
+    cparams.moe_slot_log                 = static_cast<int32_t>(params.moe_slot_log);
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;

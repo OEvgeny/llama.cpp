@@ -175,6 +175,11 @@ public:
         layer_prev_selected_.clear();
     }
 
+    void clear_slots() {
+        gid_to_slot_.clear();
+        std::fill(slot_to_gid_.begin(), slot_to_gid_.end(), -1);
+    }
+
     const Config & config() const { return cfg_; }
 
     void begin_decode_step(int token_index) {
