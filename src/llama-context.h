@@ -43,15 +43,37 @@ struct llama_context {
         int32_t cpu_fallback_layers = 0;
         int32_t moves_applied = 0;
         uint64_t copy_bytes = 0;
+        int32_t copy_failures = 0;
+        int32_t pending_slots = 0;
     };
 
     struct moe_slot_runtime_state {
+        enum moe_tensor_family : int32_t {
+            MOE_FAMILY_UP_EXPS = 0,
+            MOE_FAMILY_DOWN_EXPS,
+            MOE_FAMILY_GATE_EXPS,
+            MOE_FAMILY_GATE_UP_EXPS,
+            MOE_FAMILY_UP_CHEXPS,
+            MOE_FAMILY_DOWN_CHEXPS,
+            MOE_FAMILY_GATE_CHEXPS,
+            MOE_FAMILY_COUNT
+        };
+
+        struct source_family_entry {
+            const ggml_tensor * tensor = nullptr;
+            uint64_t single_expert_bytes = 0;
+            int32_t group_id = -1;
+        };
+
         struct tensor_group {
+            int32_t group_id = -1;
             std::string family;
             ggml_type type = GGML_TYPE_COUNT;
             std::array<int64_t, 4> ne = { 0, 0, 0, 0 };
             uint64_t single_expert_bytes = 0;
             std::vector<int32_t> layers;
+            ggml_backend_buffer_type_t dst_buft = nullptr;
+            ggml_tensor * slot_bank_tensor = nullptr;
         };
 
         bool enabled = false;
@@ -73,7 +95,11 @@ struct llama_context {
         std::vector<int64_t> layer_gpu_hit;
         std::vector<int64_t> layer_cpu_fallback;
         std::vector<uint64_t> layer_expert_slice_bytes;
+        std::vector<std::array<source_family_entry, MOE_FAMILY_COUNT>> layer_sources;
         std::vector<tensor_group> tensor_groups;
+        std::vector<ggml_context_ptr> slot_bank_ctx;
+        std::vector<ggml_backend_buffer_ptr> slot_bank_buf;
+        std::vector<uint8_t> copy_scratch;
 
         moe_slot_runtime_counters token_counters;
 

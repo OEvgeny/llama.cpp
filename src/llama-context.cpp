@@ -82,6 +82,30 @@ static bool is_moe_topk_tensor(const ggml_tensor * t) {
     return std::strncmp(t->name, "ffn_moe_topk-", 13) == 0;
 }
 
+static int32_t moe_family_id_from_name(const char * family) {
+    if (family == nullptr) {
+        return -1;
+    }
+    if (std::strcmp(family, "up_exps") == 0)      return llama_context::moe_slot_runtime_state::MOE_FAMILY_UP_EXPS;
+    if (std::strcmp(family, "down_exps") == 0)    return llama_context::moe_slot_runtime_state::MOE_FAMILY_DOWN_EXPS;
+    if (std::strcmp(family, "gate_exps") == 0)    return llama_context::moe_slot_runtime_state::MOE_FAMILY_GATE_EXPS;
+    if (std::strcmp(family, "gate_up_exps") == 0) return llama_context::moe_slot_runtime_state::MOE_FAMILY_GATE_UP_EXPS;
+    if (std::strcmp(family, "up_chexps") == 0)    return llama_context::moe_slot_runtime_state::MOE_FAMILY_UP_CHEXPS;
+    if (std::strcmp(family, "down_chexps") == 0)  return llama_context::moe_slot_runtime_state::MOE_FAMILY_DOWN_CHEXPS;
+    if (std::strcmp(family, "gate_chexps") == 0)  return llama_context::moe_slot_runtime_state::MOE_FAMILY_GATE_CHEXPS;
+    return -1;
+}
+
+static size_t moe_count_pending_slots(const llama_context::moe_slot_runtime_state & rt) {
+    size_t pending = 0;
+    for (size_t i = 0; i < rt.slot_to_gid.size(); ++i) {
+        if (rt.slot_to_gid[i] >= 0 && rt.slot_ready[i] == 0) {
+            pending++;
+        }
+    }
+    return pending;
+}
+
 static void configure_moe_slot_planner(
         llama_context::moe_slot_runtime_state & rt,
         const llama_model & model,
@@ -146,7 +170,11 @@ static void configure_moe_slot_planner(
 
     std::unordered_map<group_key, size_t, group_key_hash> group_index;
     rt.layer_expert_slice_bytes.assign((size_t) hparams.n_layer, 0);
+    rt.layer_sources.assign((size_t) hparams.n_layer, {});
     rt.tensor_groups.clear();
+    rt.slot_bank_ctx.clear();
+    rt.slot_bank_buf.clear();
+    rt.copy_scratch.clear();
 
     auto add_tensor = [&](const ggml_tensor * t, int32_t il, const char * family) {
         if (t == nullptr || t->ne[2] <= 0 || il < 0 || il >= (int32_t) rt.layer_expert_slice_bytes.size()) {
@@ -162,8 +190,10 @@ static void configure_moe_slot_planner(
         key.ne = { t->ne[0], t->ne[1], t->ne[2], t->ne[3] };
 
         auto it = group_index.find(key);
+        int32_t group_id = -1;
         if (it == group_index.end()) {
             llama_context::moe_slot_runtime_state::tensor_group group;
+            group.group_id = (int32_t) rt.tensor_groups.size();
             group.family = key.family;
             group.type = key.type;
             group.ne = key.ne;
@@ -173,9 +203,19 @@ static void configure_moe_slot_planner(
             const size_t idx = rt.tensor_groups.size();
             rt.tensor_groups.push_back(std::move(group));
             group_index.emplace(std::move(key), idx);
+            group_id = (int32_t) idx;
         } else {
             auto & group = rt.tensor_groups[it->second];
             group.layers.push_back(il);
+            group_id = (int32_t) it->second;
+        }
+
+        const int32_t family_id = moe_family_id_from_name(family);
+        if (family_id >= 0 && family_id < llama_context::moe_slot_runtime_state::MOE_FAMILY_COUNT) {
+            auto & entry = rt.layer_sources[il][family_id];
+            entry.tensor = t;
+            entry.single_expert_bytes = single_expert_bytes;
+            entry.group_id = group_id;
         }
     };
 
@@ -190,6 +230,90 @@ static void configure_moe_slot_planner(
         add_tensor(layer.ffn_gate_chexps, il, "gate_chexps");
     }
 
+    auto has_all = [](const std::array<llama_context::moe_slot_runtime_state::source_family_entry, llama_context::moe_slot_runtime_state::MOE_FAMILY_COUNT> & src, std::initializer_list<int32_t> families) {
+        for (int32_t family : families) {
+            if (src[family].tensor == nullptr) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    for (int32_t il = 0; il < (int32_t) rt.layer_sources.size(); ++il) {
+        const auto & src = rt.layer_sources[il];
+        const bool has_any_moe = std::any_of(src.begin(), src.end(), [](const auto & e) { return e.tensor != nullptr; });
+        if (!has_any_moe) {
+            continue;
+        }
+
+        const bool has_gate_up = src[llama_context::moe_slot_runtime_state::MOE_FAMILY_GATE_UP_EXPS].tensor != nullptr;
+        const bool has_base = src[llama_context::moe_slot_runtime_state::MOE_FAMILY_UP_EXPS].tensor != nullptr ||
+                              src[llama_context::moe_slot_runtime_state::MOE_FAMILY_DOWN_EXPS].tensor != nullptr ||
+                              src[llama_context::moe_slot_runtime_state::MOE_FAMILY_GATE_EXPS].tensor != nullptr;
+        const bool has_chexp = src[llama_context::moe_slot_runtime_state::MOE_FAMILY_UP_CHEXPS].tensor != nullptr ||
+                               src[llama_context::moe_slot_runtime_state::MOE_FAMILY_DOWN_CHEXPS].tensor != nullptr ||
+                               src[llama_context::moe_slot_runtime_state::MOE_FAMILY_GATE_CHEXPS].tensor != nullptr;
+
+        if (has_gate_up && !has_all(src, {
+                llama_context::moe_slot_runtime_state::MOE_FAMILY_DOWN_EXPS,
+                llama_context::moe_slot_runtime_state::MOE_FAMILY_GATE_UP_EXPS })) {
+            throw std::runtime_error(format("moe slot cache: layer %d missing required gate_up_exps/down_exps tensors", il));
+        }
+        if (has_base && !has_gate_up && !has_all(src, {
+                llama_context::moe_slot_runtime_state::MOE_FAMILY_UP_EXPS,
+                llama_context::moe_slot_runtime_state::MOE_FAMILY_DOWN_EXPS,
+                llama_context::moe_slot_runtime_state::MOE_FAMILY_GATE_EXPS })) {
+            throw std::runtime_error(format("moe slot cache: layer %d missing required up/down/gate expert tensors", il));
+        }
+        if (has_chexp && !has_all(src, {
+                llama_context::moe_slot_runtime_state::MOE_FAMILY_UP_CHEXPS,
+                llama_context::moe_slot_runtime_state::MOE_FAMILY_DOWN_CHEXPS,
+                llama_context::moe_slot_runtime_state::MOE_FAMILY_GATE_CHEXPS })) {
+            throw std::runtime_error(format("moe slot cache: layer %d missing required up/down/gate chexp tensors", il));
+        }
+    }
+
+    uint64_t total_slot_bank_bytes = 0;
+    rt.slot_bank_ctx.reserve(rt.tensor_groups.size());
+    rt.slot_bank_buf.reserve(rt.tensor_groups.size());
+    uint64_t max_single_expert_bytes = 0;
+    for (auto & g : rt.tensor_groups) {
+        max_single_expert_bytes = std::max(max_single_expert_bytes, g.single_expert_bytes);
+        const uint64_t slot_bank_bytes = g.single_expert_bytes * (uint64_t) cparams.moe_slot_count;
+        total_slot_bank_bytes += slot_bank_bytes;
+
+        GGML_ASSERT(!g.layers.empty());
+        const int32_t il_ref = g.layers.front();
+        g.dst_buft = model.select_buft(il_ref);
+        for (int32_t il : g.layers) {
+            if (model.select_buft(il) != g.dst_buft) {
+                throw std::runtime_error(format("moe slot cache: tensor group '%s' has mixed destination backends across layers", g.family.c_str()));
+            }
+        }
+
+        ggml_init_params params_ctx = {
+            /*.mem_size   =*/ ggml_tensor_overhead(),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        rt.slot_bank_ctx.emplace_back(ggml_init(params_ctx));
+        if (!rt.slot_bank_ctx.back()) {
+            throw std::runtime_error(format("moe slot cache: failed to create context for group '%s'", g.family.c_str()));
+        }
+
+        g.slot_bank_tensor = ggml_new_tensor_1d(rt.slot_bank_ctx.back().get(), GGML_TYPE_I8, (int64_t) slot_bank_bytes);
+        if (!g.slot_bank_tensor) {
+            throw std::runtime_error(format("moe slot cache: failed to create slot-bank tensor for group '%s'", g.family.c_str()));
+        }
+
+        ggml_backend_buffer_ptr slot_buf(ggml_backend_alloc_ctx_tensors_from_buft(rt.slot_bank_ctx.back().get(), g.dst_buft));
+        if (!slot_buf) {
+            throw std::runtime_error(format("moe slot cache: failed to allocate slot bank for group '%s' (%" PRIu64 " bytes)", g.family.c_str(), slot_bank_bytes));
+        }
+        rt.slot_bank_buf.emplace_back(std::move(slot_buf));
+    }
+    rt.copy_scratch.resize((size_t) max_single_expert_bytes);
+
     LLAMA_LOG_INFO(
         "%s: enabled n_layers=%d n_expert=%d top_k=%d slots=%d moves=%d bootstrap=%s prefill=%s log=%d\n",
         __func__,
@@ -201,16 +325,19 @@ static void configure_moe_slot_planner(
         cparams.moe_slot_bootstrap == 0 ? "seed" : "empty",
         cparams.moe_slot_prefill == 0 ? "freeze" : "observe",
         cparams.moe_slot_log);
+    LLAMA_LOG_INFO("%s: moe slot plan groups=%zu total_slot_bank_bytes=%" PRIu64 "\n",
+        __func__, rt.tensor_groups.size(), total_slot_bank_bytes);
 
     if (rt.planner_log >= 1) {
         for (size_t i = 0; i < rt.tensor_groups.size(); ++i) {
             const auto & g = rt.tensor_groups[i];
             LLAMA_LOG_INFO(
-                "%s: moe slot tensor-group[%zu] family=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] layers=%zu single_expert_bytes=%" PRIu64 " slot_bank_bytes=%" PRIu64 "\n",
+                "%s: moe slot tensor-group[%zu] family=%s type=%s dst=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] layers=%zu single_expert_bytes=%" PRIu64 " slot_bank_bytes=%" PRIu64 "\n",
                 __func__,
                 i,
                 g.family.c_str(),
                 ggml_type_name(g.type),
+                ggml_backend_buft_name(g.dst_buft),
                 g.ne[0], g.ne[1], g.ne[2], g.ne[3],
                 g.layers.size(),
                 g.single_expert_bytes,
@@ -313,28 +440,21 @@ static bool moe_selected_experts_eval_cb(struct ggml_tensor * t, bool ask, void 
     return true;
 }
 
-static uint64_t moe_expert_slice_bytes_for_layer(
-        const llama_context::moe_slot_runtime_state & rt,
-        int32_t il) {
-    if (il < 0 || il >= (int32_t) rt.layer_expert_slice_bytes.size()) {
-        return 0;
-    }
-    return rt.layer_expert_slice_bytes[il];
-}
-
 static void apply_moe_slot_plan(
         llama_context::moe_slot_runtime_state & rt,
         const llama_moe_plan::TokenPlan & plan) {
     rt.token_counters.moves_applied = (int32_t) plan.fills.size();
+    rt.token_counters.copy_failures = 0;
 
     for (const auto & fill : plan.fills) {
         if (fill.slot < 0 || fill.slot >= (int) rt.slot_to_gid.size()) {
             continue;
         }
 
+        const int old_gid = rt.slot_to_gid[fill.slot];
+        const uint8_t old_ready = rt.slot_ready[fill.slot];
         rt.slot_ready[fill.slot] = 0; // pending copy
 
-        const int old_gid = rt.slot_to_gid[fill.slot];
         if (old_gid >= 0) {
             rt.gid_to_slot.erase(old_gid);
             const int old_layer = rt.n_expert_per_layer > 0 ? old_gid / rt.n_expert_per_layer : -1;
@@ -350,10 +470,67 @@ static void apply_moe_slot_plan(
             rt.expert_to_slot[fill.layer][fill.expert] = fill.slot;
         }
 
-        // prototype: synchronous copy completion
-        rt.slot_ready[fill.slot] = 1;
-        rt.token_counters.copy_bytes += moe_expert_slice_bytes_for_layer(rt, fill.layer);
+        bool copy_ok = true;
+        bool wrote_any = false;
+        uint64_t bytes_copied = 0;
+        if (fill.layer >= 0 && fill.layer < (int) rt.layer_sources.size()) {
+            const auto & src = rt.layer_sources[fill.layer];
+            for (const auto & src_entry : src) {
+                if (!src_entry.tensor) {
+                    continue;
+                }
+                if (src_entry.group_id < 0 || src_entry.group_id >= (int32_t) rt.tensor_groups.size()) {
+                    copy_ok = false;
+                    break;
+                }
+                auto & group = rt.tensor_groups[src_entry.group_id];
+                if (fill.expert < 0 || fill.expert >= src_entry.tensor->ne[2]) {
+                    copy_ok = false;
+                    break;
+                }
+                if (!group.slot_bank_tensor || src_entry.single_expert_bytes > rt.copy_scratch.size()) {
+                    copy_ok = false;
+                    break;
+                }
+                const size_t src_offset = (size_t) fill.expert * src_entry.tensor->nb[2];
+                const size_t dst_offset = (size_t) fill.slot * (size_t) group.single_expert_bytes;
+
+                ggml_backend_tensor_get(src_entry.tensor, rt.copy_scratch.data(), src_offset, (size_t) src_entry.single_expert_bytes);
+                ggml_backend_tensor_set(group.slot_bank_tensor, rt.copy_scratch.data(), dst_offset, (size_t) src_entry.single_expert_bytes);
+                wrote_any = true;
+                bytes_copied += src_entry.single_expert_bytes;
+            }
+        } else {
+            copy_ok = false;
+        }
+
+        if (copy_ok) {
+            rt.slot_ready[fill.slot] = 1;
+            rt.token_counters.copy_bytes += bytes_copied;
+        } else {
+            rt.token_counters.copy_failures++;
+            if (!wrote_any && old_gid >= 0) {
+                // restore logical mapping when no writes occurred
+                rt.slot_to_gid[fill.slot] = old_gid;
+                rt.gid_to_slot[old_gid] = fill.slot;
+                const int old_layer = rt.n_expert_per_layer > 0 ? old_gid / rt.n_expert_per_layer : -1;
+                const int old_expert = rt.n_expert_per_layer > 0 ? old_gid % rt.n_expert_per_layer : -1;
+                if (old_layer >= 0 && old_layer < (int) rt.expert_to_slot.size() && old_expert >= 0 && old_expert < (int) rt.expert_to_slot[old_layer].size()) {
+                    rt.expert_to_slot[old_layer][old_expert] = fill.slot;
+                }
+                rt.slot_ready[fill.slot] = old_ready;
+            } else {
+                rt.slot_to_gid[fill.slot] = -1;
+                rt.slot_ready[fill.slot] = 0;
+                rt.gid_to_slot.erase(fill.gid);
+                if (fill.layer >= 0 && fill.layer < (int) rt.expert_to_slot.size() && fill.expert >= 0 && fill.expert < (int) rt.expert_to_slot[fill.layer].size()) {
+                    rt.expert_to_slot[fill.layer][fill.expert] = -1;
+                }
+            }
+            LLAMA_LOG_WARN("%s: moe slot copy failed for layer=%d expert=%d slot=%d\n", __func__, fill.layer, fill.expert, fill.slot);
+        }
     }
+    rt.token_counters.pending_slots = (int32_t) moe_count_pending_slots(rt);
 }
 
 static void update_moe_layer_routing_counters(
@@ -2125,6 +2302,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     moe_slot_runtime.token_counters.cpu_fallback_layers,
                     moe_slot_runtime.token_counters.moves_applied,
                     moe_slot_runtime.token_counters.copy_bytes);
+                LLAMA_LOG_INFO("%s: moe slot copy counters failures=%d pending_slots=%d\n",
+                    __func__,
+                    moe_slot_runtime.token_counters.copy_failures,
+                    moe_slot_runtime.token_counters.pending_slots);
             }
 
             if (moe_slot_runtime.planner_log >= 2) {
