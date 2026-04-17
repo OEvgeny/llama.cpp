@@ -5,11 +5,15 @@
 #include "llama-graph.h"
 #include "llama-adapter.h"
 #include "llama-impl.h"
+#include "llama_moe_slot_planner.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
 
+#include <array>
 #include <map>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 struct llama_model;
@@ -34,6 +38,49 @@ struct llama_memory_breakdown_data {
 };
 
 struct llama_context {
+    struct moe_slot_runtime_counters {
+        int32_t gpu_hit_layers = 0;
+        int32_t cpu_fallback_layers = 0;
+        int32_t moves_applied = 0;
+        uint64_t copy_bytes = 0;
+    };
+
+    struct moe_slot_runtime_state {
+        struct tensor_group {
+            std::string family;
+            ggml_type type = GGML_TYPE_COUNT;
+            std::array<int64_t, 4> ne = { 0, 0, 0, 0 };
+            uint64_t single_expert_bytes = 0;
+            std::vector<int32_t> layers;
+        };
+
+        bool enabled = false;
+        bool in_prefill = false;
+        int32_t planner_log = 0;
+        int32_t n_expert_per_layer = 0;
+        int64_t planner_token_index = 0;
+
+        llama_moe_plan::SlotPlanner planner;
+
+        std::map<int, std::vector<int32_t>> selected_experts_host;
+        std::map<int, std::vector<int32_t>> prev_selected_experts;
+
+        std::unordered_map<int, int> gid_to_slot;
+        std::vector<int> slot_to_gid;
+        std::vector<std::vector<int>> expert_to_slot;
+        std::vector<uint8_t> slot_ready; // 0 = pending/empty, 1 = ready
+
+        std::vector<int64_t> layer_gpu_hit;
+        std::vector<int64_t> layer_cpu_fallback;
+        std::vector<uint64_t> layer_expert_slice_bytes;
+        std::vector<tensor_group> tensor_groups;
+
+        moe_slot_runtime_counters token_counters;
+
+        void reset_runtime_maps(int32_t n_layer, int32_t n_expert, int32_t slot_count, bool seed);
+        void reset_step_counters();
+    };
+
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
             const llama_model & model,
@@ -356,4 +403,6 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+
+    moe_slot_runtime_state moe_slot_runtime;
 };
