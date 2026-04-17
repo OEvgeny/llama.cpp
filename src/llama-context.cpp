@@ -56,6 +56,16 @@ void llama_context::moe_slot_runtime_state::reset_runtime_maps(int32_t n_layer, 
 
     layer_gpu_hit.assign(std::max(0, n_layer), 0);
     layer_cpu_fallback.assign(std::max(0, n_layer), 0);
+    layer_hit_window_samples.assign(std::max(0, n_layer), {});
+    layer_hit_window_pos.assign(std::max(0, n_layer), 0);
+    layer_hit_window_count.assign(std::max(0, n_layer), 0);
+    layer_hit_window_hits.assign(std::max(0, n_layer), 0);
+
+    if (layer_hit_window > 0) {
+        for (auto & samples : layer_hit_window_samples) {
+            samples.assign((size_t) layer_hit_window, 0);
+        }
+    }
 }
 
 void llama_context::moe_slot_runtime_state::reset_step_counters() {
@@ -106,6 +116,40 @@ static size_t moe_count_pending_slots(const llama_context::moe_slot_runtime_stat
     return pending;
 }
 
+static void moe_record_layer_hit_window(
+        llama_context::moe_slot_runtime_state & rt,
+        int il,
+        bool hit) {
+    if (rt.layer_hit_window <= 0 || il < 0 || il >= (int) rt.layer_hit_window_samples.size()) {
+        return;
+    }
+
+    auto & samples = rt.layer_hit_window_samples[il];
+    if (samples.empty()) {
+        return;
+    }
+
+    const int32_t window = (int32_t) samples.size();
+    int32_t & pos = rt.layer_hit_window_pos[il];
+    int32_t & count = rt.layer_hit_window_count[il];
+    int32_t & hits = rt.layer_hit_window_hits[il];
+
+    if (count >= window) {
+        const uint8_t old = samples[(size_t) pos];
+        if (old) {
+            hits--;
+        }
+    } else {
+        count++;
+    }
+
+    samples[(size_t) pos] = hit ? 1 : 0;
+    if (hit) {
+        hits++;
+    }
+    pos = (pos + 1) % window;
+}
+
 static void configure_moe_slot_planner(
         llama_context::moe_slot_runtime_state & rt,
         const llama_model & model,
@@ -113,6 +157,7 @@ static void configure_moe_slot_planner(
         const llama_cparams & cparams) {
     rt.enabled = cparams.moe_slot_count > 0 && hparams.n_expert > 0 && hparams.n_expert_used > 0;
     rt.planner_log = cparams.moe_slot_log;
+    rt.layer_hit_window = std::max(0, cparams.moe_slot_window);
 
     rt.selected_experts_host.clear();
     rt.prev_selected_experts.clear();
@@ -561,11 +606,13 @@ static void update_moe_layer_routing_counters(
             if (il < (int) rt.layer_gpu_hit.size()) {
                 rt.layer_gpu_hit[il]++;
             }
+            moe_record_layer_hit_window(rt, il, true);
         } else {
             rt.token_counters.cpu_fallback_layers++;
             if (il < (int) rt.layer_cpu_fallback.size()) {
                 rt.layer_cpu_fallback[il]++;
             }
+            moe_record_layer_hit_window(rt, il, false);
         }
     }
 }
@@ -2313,11 +2360,22 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     if (moe_slot_runtime.layer_gpu_hit[il] == 0 && moe_slot_runtime.layer_cpu_fallback[il] == 0) {
                         continue;
                     }
+                    const int32_t roll_count = il < moe_slot_runtime.layer_hit_window_count.size() ? moe_slot_runtime.layer_hit_window_count[il] : 0;
+                    const int32_t roll_hits = il < moe_slot_runtime.layer_hit_window_hits.size() ? moe_slot_runtime.layer_hit_window_hits[il] : 0;
+                    const float rolling_hit_rate = roll_count > 0 ? (float) roll_hits / (float) roll_count : 0.0f;
                     LLAMA_LOG_INFO("%s: moe slot layer=%zu gpu_hit=%" PRId64 " cpu_fallback=%" PRId64 "\n",
                         __func__,
                         il,
                         moe_slot_runtime.layer_gpu_hit[il],
                         moe_slot_runtime.layer_cpu_fallback[il]);
+                    if (moe_slot_runtime.layer_hit_window > 0) {
+                        LLAMA_LOG_INFO("%s: moe slot layer=%zu rolling_hit_rate=%.3f window=%d samples=%d\n",
+                            __func__,
+                            il,
+                            rolling_hit_rate,
+                            moe_slot_runtime.layer_hit_window,
+                            roll_count);
+                    }
                 }
             }
         }

@@ -94,6 +94,11 @@ struct llama_context {
 
         std::vector<int64_t> layer_gpu_hit;
         std::vector<int64_t> layer_cpu_fallback;
+        int32_t layer_hit_window = 0;
+        std::vector<std::vector<uint8_t>> layer_hit_window_samples;
+        std::vector<int32_t> layer_hit_window_pos;
+        std::vector<int32_t> layer_hit_window_count;
+        std::vector<int32_t> layer_hit_window_hits;
         std::vector<uint64_t> layer_expert_slice_bytes;
         std::vector<std::array<source_family_entry, MOE_FAMILY_COUNT>> layer_sources;
         std::vector<tensor_group> tensor_groups;
