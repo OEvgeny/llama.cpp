@@ -108,9 +108,16 @@ struct llama_context {
         std::vector<int32_t> layer_hit_window_hits;
         std::vector<uint64_t> layer_expert_slice_bytes;
         std::vector<std::array<source_family_entry, MOE_FAMILY_COUNT>> layer_sources;
+        std::vector<ggml_tensor *> layer_expert_to_slot_tensors;
+        std::vector<ggml_tensor *> layer_slot_up_exps;
+        std::vector<ggml_tensor *> layer_slot_gate_exps;
+        std::vector<ggml_tensor *> layer_slot_gate_up_exps;
+        std::vector<ggml_tensor *> layer_slot_down_exps;
         std::vector<tensor_group> tensor_groups;
         std::vector<ggml_context_ptr> slot_bank_ctx;
         std::vector<ggml_backend_buffer_ptr> slot_bank_buf;
+        ggml_context_ptr expert_to_slot_ctx;
+        ggml_backend_buffer_ptr expert_to_slot_buf;
         std::vector<uint8_t> copy_scratch;
 
         moe_slot_runtime_counters token_counters;

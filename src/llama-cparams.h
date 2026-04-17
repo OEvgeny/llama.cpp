@@ -35,6 +35,11 @@ struct llama_cparams {
     int32_t moe_slot_bootstrap;
     int32_t moe_slot_prefill;
     int32_t moe_slot_log;
+    const struct ggml_tensor * const * moe_slot_expert_to_slot = nullptr; // [n_layer] each I32 [n_expert]
+    const struct ggml_tensor * const * moe_slot_up_exps        = nullptr; // [n_layer]
+    const struct ggml_tensor * const * moe_slot_gate_exps      = nullptr; // [n_layer]
+    const struct ggml_tensor * const * moe_slot_gate_up_exps   = nullptr; // [n_layer]
+    const struct ggml_tensor * const * moe_slot_down_exps      = nullptr; // [n_layer]
 
     bool embeddings;
     bool causal_attn;

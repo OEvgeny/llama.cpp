@@ -1304,11 +1304,23 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * slot_gate_exps,
          ggml_tensor * slot_gate_up_exps,
          ggml_tensor * slot_down_exps) const {
-    (void) expert_to_slot;
-    (void) slot_up_exps;
-    (void) slot_gate_exps;
-    (void) slot_gate_up_exps;
-    (void) slot_down_exps;
+    if (il >= 0 && il < (int) n_layer) {
+        if (expert_to_slot == nullptr && cparams.moe_slot_expert_to_slot) {
+            expert_to_slot = (ggml_tensor *) cparams.moe_slot_expert_to_slot[il];
+        }
+        if (slot_up_exps == nullptr && cparams.moe_slot_up_exps) {
+            slot_up_exps = (ggml_tensor *) cparams.moe_slot_up_exps[il];
+        }
+        if (slot_gate_exps == nullptr && cparams.moe_slot_gate_exps) {
+            slot_gate_exps = (ggml_tensor *) cparams.moe_slot_gate_exps[il];
+        }
+        if (slot_gate_up_exps == nullptr && cparams.moe_slot_gate_up_exps) {
+            slot_gate_up_exps = (ggml_tensor *) cparams.moe_slot_gate_up_exps[il];
+        }
+        if (slot_down_exps == nullptr && cparams.moe_slot_down_exps) {
+            slot_down_exps = (ggml_tensor *) cparams.moe_slot_down_exps[il];
+        }
+    }
 
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
@@ -1397,6 +1409,33 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_format_name(selected_experts, "ffn_moe_topk-%d", il);
     cb(selected_experts, "ffn_moe_topk", il);
 
+    ggml_tensor * selected_slots = nullptr;
+    ggml_tensor * route_mode_cpu_fallback = nullptr;
+    ggml_tensor * route_mode_gpu_hit = nullptr;
+    if (expert_to_slot != nullptr &&
+        slot_down_exps != nullptr &&
+        ((slot_gate_up_exps != nullptr) || (slot_up_exps != nullptr && slot_gate_exps != nullptr))) {
+        selected_slots = ggml_get_rows(ctx0, expert_to_slot, selected_experts); // [1, n_expert_used, n_tokens]
+        cb(selected_slots, "ffn_moe_slots", il);
+
+        ggml_tensor * missing = ggml_fill(ctx0, selected_slots, -1.0f);
+        ggml_tensor * missing_count = ggml_count_equal(ctx0, selected_slots, missing); // [1] I64
+        missing_count = ggml_cast(ctx0, missing_count, GGML_TYPE_F32);
+        route_mode_cpu_fallback = ggml_step(ctx0, missing_count); // [1] F32 (1 fallback, 0 hit)
+
+        ggml_tensor * zero = ggml_sub(ctx0, route_mode_cpu_fallback, route_mode_cpu_fallback);
+        route_mode_gpu_hit = ggml_count_equal(ctx0, route_mode_cpu_fallback, zero); // [1] I64 (1 hit, 0 fallback)
+        route_mode_gpu_hit = ggml_cast(ctx0, route_mode_gpu_hit, GGML_TYPE_F32);
+
+        cb(route_mode_gpu_hit, "ffn_moe_route_gpu_hit", il);
+        cb(route_mode_cpu_fallback, "ffn_moe_route_cpu_fallback", il);
+
+        if (slot_down_exps->ne[2] > 0) {
+            selected_slots = ggml_clamp(ctx0, selected_slots, 0.0f, (float) (slot_down_exps->ne[2] - 1));
+            cb(selected_slots, "ffn_moe_slots_clamped", il);
+        }
+    }
+
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
         // TODO: Use scalar div instead when/if implemented
         ggml_tensor * f_sel = ggml_cast(ctx0, selected_experts, GGML_TYPE_F32);
@@ -1451,10 +1490,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
+    ggml_tensor * cur_moe_in = cur;
 
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
         ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts); // [n_ff*2, n_expert_used, n_tokens]
+        if (selected_slots && slot_gate_up_exps) {
+            ggml_tensor * gate_up_slot = build_lora_mm_id(slot_gate_up_exps, cur, selected_slots);
+            gate_up = ggml_add(ctx0,
+                ggml_mul(ctx0, gate_up, route_mode_cpu_fallback),
+                ggml_mul(ctx0, gate_up_slot, route_mode_gpu_hit));
+            cb(gate_up, "ffn_moe_gate_up_routed", il);
+        }
         cb(gate_up, "ffn_moe_gate_up", il);
 
         if (gate_up_exps_b) {
@@ -1478,7 +1525,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
     } else {
         // separate gate and up path
-        up = build_lora_mm_id(up_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
+        up = build_lora_mm_id(up_exps, cur_moe_in, selected_experts); // [n_ff, n_expert_used, n_tokens]
+        if (selected_slots && slot_up_exps) {
+            ggml_tensor * up_slot = build_lora_mm_id(slot_up_exps, cur_moe_in, selected_slots);
+            up = ggml_add(ctx0,
+                ggml_mul(ctx0, up, route_mode_cpu_fallback),
+                ggml_mul(ctx0, up_slot, route_mode_gpu_hit));
+            cb(up, "ffn_moe_up_routed", il);
+        }
         cb(up, "ffn_moe_up", il);
 
         if (up_exps_b) {
@@ -1496,7 +1550,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_exps) {
-            cur = build_lora_mm_id(gate_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
+            cur = build_lora_mm_id(gate_exps, cur_moe_in, selected_experts); // [n_ff, n_expert_used, n_tokens]
+            if (selected_slots && slot_gate_exps) {
+                ggml_tensor * gate_slot = build_lora_mm_id(slot_gate_exps, cur_moe_in, selected_slots);
+                cur = ggml_add(ctx0,
+                    ggml_mul(ctx0, cur, route_mode_cpu_fallback),
+                    ggml_mul(ctx0, gate_slot, route_mode_gpu_hit));
+                cb(cur, "ffn_moe_gate_routed", il);
+            }
             cb(cur, "ffn_moe_gate", il);
         } else {
             cur = up;
@@ -1587,6 +1648,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     experts = build_lora_mm_id(down_exps, cur, selected_experts); // [n_embd, n_expert_used, n_tokens]
+    if (selected_slots && slot_down_exps) {
+        ggml_tensor * experts_slot = build_lora_mm_id(slot_down_exps, cur, selected_slots);
+        experts = ggml_add(ctx0,
+            ggml_mul(ctx0, experts, route_mode_cpu_fallback),
+            ggml_mul(ctx0, experts_slot, route_mode_gpu_hit));
+        cb(experts, "ffn_moe_down_routed", il);
+    }
     cb(experts, "ffn_moe_down", il);
 
     if (down_exps_b) {

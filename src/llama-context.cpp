@@ -120,6 +120,17 @@ static bool moe_slot_is_ready(const llama_context::moe_slot_runtime_state & rt, 
     return slot >= 0 && slot < (int) rt.slot_state.size() && rt.slot_state[slot] == llama_context::moe_slot_runtime_state::SLOT_READY;
 }
 
+static void moe_sync_expert_to_slot_tensors(llama_context::moe_slot_runtime_state & rt) {
+    for (size_t il = 0; il < rt.layer_expert_to_slot_tensors.size(); ++il) {
+        ggml_tensor * t = rt.layer_expert_to_slot_tensors[il];
+        if (!t || il >= rt.expert_to_slot.size()) {
+            continue;
+        }
+        const auto & row = rt.expert_to_slot[il];
+        ggml_backend_tensor_set(t, row.data(), 0, row.size() * sizeof(int32_t));
+    }
+}
+
 static void moe_assert_slot_map_consistency(
         const llama_context::moe_slot_runtime_state & rt,
         int32_t planner_token_index,
@@ -261,9 +272,16 @@ static void configure_moe_slot_planner(
     std::unordered_map<group_key, size_t, group_key_hash> group_index;
     rt.layer_expert_slice_bytes.assign((size_t) hparams.n_layer, 0);
     rt.layer_sources.assign((size_t) hparams.n_layer, {});
+    rt.layer_expert_to_slot_tensors.assign((size_t) hparams.n_layer, nullptr);
+    rt.layer_slot_up_exps.assign((size_t) hparams.n_layer, nullptr);
+    rt.layer_slot_gate_exps.assign((size_t) hparams.n_layer, nullptr);
+    rt.layer_slot_gate_up_exps.assign((size_t) hparams.n_layer, nullptr);
+    rt.layer_slot_down_exps.assign((size_t) hparams.n_layer, nullptr);
     rt.tensor_groups.clear();
     rt.slot_bank_ctx.clear();
     rt.slot_bank_buf.clear();
+    rt.expert_to_slot_ctx.reset();
+    rt.expert_to_slot_buf.reset();
     rt.copy_scratch.clear();
 
     auto add_tensor = [&](const ggml_tensor * t, int32_t il, const char * family) {
@@ -391,7 +409,9 @@ static void configure_moe_slot_planner(
             throw std::runtime_error(format("moe slot cache: failed to create context for group '%s'", g.family.c_str()));
         }
 
-        g.slot_bank_tensor = ggml_new_tensor_1d(rt.slot_bank_ctx.back().get(), GGML_TYPE_I8, (int64_t) slot_bank_bytes);
+        std::array<int64_t, 4> ne_slot = g.ne;
+        ne_slot[2] = cparams.moe_slot_count;
+        g.slot_bank_tensor = ggml_new_tensor(rt.slot_bank_ctx.back().get(), g.type, 4, ne_slot.data());
         if (!g.slot_bank_tensor) {
             throw std::runtime_error(format("moe slot cache: failed to create slot-bank tensor for group '%s'", g.family.c_str()));
         }
@@ -403,6 +423,45 @@ static void configure_moe_slot_planner(
         rt.slot_bank_buf.emplace_back(std::move(slot_buf));
     }
     rt.copy_scratch.resize((size_t) max_single_expert_bytes);
+
+    ggml_init_params ets_ctx_params = {
+        /*.mem_size   =*/ ggml_tensor_overhead() * (size_t) std::max<int32_t>(hparams.n_layer, 1),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    rt.expert_to_slot_ctx.reset(ggml_init(ets_ctx_params));
+    if (!rt.expert_to_slot_ctx) {
+        throw std::runtime_error("moe slot cache: failed to create expert_to_slot context");
+    }
+    for (int32_t il = 0; il < hparams.n_layer; ++il) {
+        ggml_tensor * t = ggml_new_tensor_1d(rt.expert_to_slot_ctx.get(), GGML_TYPE_I32, hparams.n_expert);
+        if (!t) {
+            throw std::runtime_error(format("moe slot cache: failed to create expert_to_slot tensor for layer %d", il));
+        }
+        rt.layer_expert_to_slot_tensors[(size_t) il] = t;
+    }
+    rt.expert_to_slot_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(rt.expert_to_slot_ctx.get(), ggml_backend_cpu_buffer_type()));
+    if (!rt.expert_to_slot_buf) {
+        throw std::runtime_error("moe slot cache: failed to allocate expert_to_slot buffer");
+    }
+
+    auto get_slot_group_tensor = [&](int32_t il, int32_t family) -> ggml_tensor * {
+        if (il < 0 || il >= (int32_t) rt.layer_sources.size()) {
+            return nullptr;
+        }
+        const auto & src = rt.layer_sources[il][family];
+        if (src.group_id < 0 || src.group_id >= (int32_t) rt.tensor_groups.size()) {
+            return nullptr;
+        }
+        return rt.tensor_groups[src.group_id].slot_bank_tensor;
+    };
+    for (int32_t il = 0; il < hparams.n_layer; ++il) {
+        rt.layer_slot_up_exps[(size_t) il]      = get_slot_group_tensor(il, llama_context::moe_slot_runtime_state::MOE_FAMILY_UP_EXPS);
+        rt.layer_slot_down_exps[(size_t) il]    = get_slot_group_tensor(il, llama_context::moe_slot_runtime_state::MOE_FAMILY_DOWN_EXPS);
+        rt.layer_slot_gate_exps[(size_t) il]    = get_slot_group_tensor(il, llama_context::moe_slot_runtime_state::MOE_FAMILY_GATE_EXPS);
+        rt.layer_slot_gate_up_exps[(size_t) il] = get_slot_group_tensor(il, llama_context::moe_slot_runtime_state::MOE_FAMILY_GATE_UP_EXPS);
+    }
+    moe_sync_expert_to_slot_tensors(rt);
 
     LLAMA_LOG_INFO(
         "%s: enabled n_layers=%d n_expert=%d top_k=%d slots=%d moves=%d bootstrap=%s prefill=%s log=%d\n",
@@ -621,6 +680,7 @@ static void apply_moe_slot_plan(
         }
     }
     rt.token_counters.pending_slots = (int32_t) moe_count_pending_slots(rt);
+    moe_sync_expert_to_slot_tensors(rt);
 }
 
 static void update_moe_layer_routing_counters(
@@ -840,6 +900,11 @@ llama_context::llama_context(
     cparams.pipeline_parallel = false;
 
     configure_moe_slot_planner(moe_slot_runtime, model, hparams, cparams);
+    cparams.moe_slot_expert_to_slot = moe_slot_runtime.layer_expert_to_slot_tensors.empty() ? nullptr : moe_slot_runtime.layer_expert_to_slot_tensors.data();
+    cparams.moe_slot_up_exps        = moe_slot_runtime.layer_slot_up_exps.empty() ? nullptr : moe_slot_runtime.layer_slot_up_exps.data();
+    cparams.moe_slot_gate_exps      = moe_slot_runtime.layer_slot_gate_exps.empty() ? nullptr : moe_slot_runtime.layer_slot_gate_exps.data();
+    cparams.moe_slot_gate_up_exps   = moe_slot_runtime.layer_slot_gate_up_exps.empty() ? nullptr : moe_slot_runtime.layer_slot_gate_up_exps.data();
+    cparams.moe_slot_down_exps      = moe_slot_runtime.layer_slot_down_exps.empty() ? nullptr : moe_slot_runtime.layer_slot_down_exps.data();
 
     {
         const char * LLAMA_GRAPH_REUSE_DISABLE = getenv("LLAMA_GRAPH_REUSE_DISABLE");
