@@ -440,8 +440,14 @@ static void configure_moe_slot_planner(
         }
         rt.layer_expert_to_slot_tensors[(size_t) il] = t;
     }
-    rt.expert_to_slot_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(rt.expert_to_slot_ctx.get(), ggml_backend_cpu_buffer_type()));
-    if (!rt.expert_to_slot_buf) {
+    ggml_backend_buffer_type_t expert_to_slot_buft = ggml_backend_cpu_buffer_type();
+    if (!model.devices.empty()) {
+        ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(model.devices[0].dev);
+        if (host_buft != nullptr) {
+            expert_to_slot_buft = host_buft;
+        }
+    }
+    rt.expert_to_slot_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(rt.expert_to_slot_ctx.get(), expert_to_slot_buft));    if (!rt.expert_to_slot_buf) {
         throw std::runtime_error("moe slot cache: failed to allocate expert_to_slot buffer");
     }
 

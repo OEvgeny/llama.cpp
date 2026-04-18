@@ -1427,7 +1427,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         slot_down_exps != nullptr &&
         ((slot_gate_up_exps != nullptr) || (slot_up_exps != nullptr && slot_gate_exps != nullptr))) {
         ggml_tensor * expert_to_slot_rows = ggml_reshape_3d(ctx0, expert_to_slot, 1, ggml_nelements(expert_to_slot), 1); // [1, n_expert, 1]
-        expert_to_slot_rows = ggml_repeat_4d(ctx0, expert_to_slot_rows, 1, expert_to_slot_rows->ne[1], selected_experts->ne[1], 1); // [1, n_expert, n_tokens]
+        if (expert_to_slot_rows->ne[2] != selected_experts->ne[1]) {
+            expert_to_slot_rows = ggml_repeat_4d(ctx0, expert_to_slot_rows, 1, expert_to_slot_rows->ne[1], selected_experts->ne[1], 1); // [1, n_expert, n_tokens]
+        }
         selected_slots = ggml_get_rows(ctx0, expert_to_slot_rows, selected_experts); // [1, n_expert_used, n_tokens]
         selected_slots = ggml_reshape_2d(ctx0, selected_slots, selected_experts->ne[0], selected_experts->ne[1]);
         cb(selected_slots, "ffn_moe_slots", il);
