@@ -440,13 +440,7 @@ static void configure_moe_slot_planner(
         }
         rt.layer_expert_to_slot_tensors[(size_t) il] = t;
     }
-    ggml_backend_buffer_type_t expert_to_slot_buft = ggml_backend_cpu_buffer_type();
-    if (!model.devices.empty()) {
-        ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(model.devices[0].dev);
-        if (host_buft != nullptr) {
-            expert_to_slot_buft = host_buft;
-        }
-    }
+    ggml_backend_buffer_type_t expert_to_slot_buft = rt.tensor_groups.empty() ? ggml_backend_cpu_buffer_type() : rt.tensor_groups.front().dst_buft;
     rt.expert_to_slot_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(rt.expert_to_slot_ctx.get(), expert_to_slot_buft));
     if (!rt.expert_to_slot_buf) {
         throw std::runtime_error("moe slot cache: failed to allocate expert_to_slot buffer");
@@ -467,6 +461,53 @@ static void configure_moe_slot_planner(
         rt.layer_slot_down_exps[(size_t) il]    = get_slot_group_tensor(il, llama_context::moe_slot_runtime_state::MOE_FAMILY_DOWN_EXPS);
         rt.layer_slot_gate_exps[(size_t) il]    = get_slot_group_tensor(il, llama_context::moe_slot_runtime_state::MOE_FAMILY_GATE_EXPS);
         rt.layer_slot_gate_up_exps[(size_t) il] = get_slot_group_tensor(il, llama_context::moe_slot_runtime_state::MOE_FAMILY_GATE_UP_EXPS);
+    }
+
+    if (!model.hparams.no_alloc) {
+        for (size_t slot = 0; slot < rt.slot_to_gid.size(); ++slot) {
+            if (rt.slot_state[slot] != llama_context::moe_slot_runtime_state::SLOT_READY) {
+                continue;
+            }
+
+            const int gid = rt.slot_to_gid[slot];
+            const int il = rt.n_expert_per_layer > 0 ? gid / rt.n_expert_per_layer : -1;
+            const int ie = rt.n_expert_per_layer > 0 ? gid % rt.n_expert_per_layer : -1;
+            if (il < 0 || il >= (int) rt.layer_sources.size()) {
+                rt.slot_state[slot] = llama_context::moe_slot_runtime_state::SLOT_EMPTY;
+                rt.slot_to_gid[slot] = -1;
+                rt.gid_to_slot.erase(gid);
+                continue;
+            }
+
+            bool copy_ok = true;
+            const auto & src = rt.layer_sources[il];
+            for (const auto & src_entry : src) {
+                if (!src_entry.tensor) {
+                    continue;
+                }
+                if (src_entry.group_id < 0 || src_entry.group_id >= (int32_t) rt.tensor_groups.size() ||
+                        ie < 0 || ie >= src_entry.tensor->ne[2] ||
+                        src_entry.single_expert_bytes > rt.copy_scratch.size()) {
+                    copy_ok = false;
+                    break;
+                }
+
+                auto & group = rt.tensor_groups[src_entry.group_id];
+                const size_t src_offset = (size_t) ie * src_entry.tensor->nb[2];
+                const size_t dst_offset = slot * (size_t) group.single_expert_bytes;
+                ggml_backend_tensor_get(src_entry.tensor, rt.copy_scratch.data(), src_offset, (size_t) src_entry.single_expert_bytes);
+                ggml_backend_tensor_set(group.slot_bank_tensor, rt.copy_scratch.data(), dst_offset, (size_t) src_entry.single_expert_bytes);
+            }
+
+            if (!copy_ok) {
+                rt.slot_state[slot] = llama_context::moe_slot_runtime_state::SLOT_EMPTY;
+                rt.slot_to_gid[slot] = -1;
+                rt.gid_to_slot.erase(gid);
+                if (il >= 0 && il < (int) rt.expert_to_slot.size() && ie >= 0 && ie < (int) rt.expert_to_slot[il].size()) {
+                    rt.expert_to_slot[il][ie] = -1;
+                }
+            }
+        }
     }
     moe_sync_expert_to_slot_tensors(rt);
 
@@ -3058,9 +3099,17 @@ llm_graph_cb llama_context::graph_get_cb() const {
                 strcmp(name, "ffn_moe_slots_clamped") == 0 ||
                 strcmp(name, "ffn_moe_route_gpu_hit") == 0 ||
                 strcmp(name, "ffn_moe_route_cpu_fallback") == 0) {
-                ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend_cpu);
+                const auto & dev_layer = model.dev_layer(il);
+                for (const auto & backend : backends) {
+                    if (ggml_backend_get_device(backend.get()) == dev_layer) {
+                        if (ggml_backend_supports_op(backend.get(), cur)) {
+                            ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
+                        }
+                    }
+                }
             }
         }
+
     };
 }
 
