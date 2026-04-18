@@ -447,7 +447,8 @@ static void configure_moe_slot_planner(
             expert_to_slot_buft = host_buft;
         }
     }
-    rt.expert_to_slot_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(rt.expert_to_slot_ctx.get(), expert_to_slot_buft));    if (!rt.expert_to_slot_buf) {
+    rt.expert_to_slot_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(rt.expert_to_slot_ctx.get(), expert_to_slot_buft));
+    if (!rt.expert_to_slot_buf) {
         throw std::runtime_error("moe slot cache: failed to allocate expert_to_slot buffer");
     }
 
@@ -3048,6 +3049,16 @@ llm_graph_cb llama_context::graph_get_cb() const {
                         }
                     }
                 }
+            }
+        }
+
+        if (moe_slot_runtime.enabled && il != -1) {
+            if (strcmp(name, "ffn_moe_topk") == 0 ||
+                strcmp(name, "ffn_moe_slots") == 0 ||
+                strcmp(name, "ffn_moe_slots_clamped") == 0 ||
+                strcmp(name, "ffn_moe_route_gpu_hit") == 0 ||
+                strcmp(name, "ffn_moe_route_cpu_fallback") == 0) {
+                ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend_cpu);
             }
         }
     };
