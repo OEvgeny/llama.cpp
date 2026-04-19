@@ -122,7 +122,7 @@ struct llama_context {
 
         moe_slot_runtime_counters token_counters;
 
-        void reset_runtime_maps(int32_t n_layer, int32_t n_expert, int32_t slot_count, bool seed);
+        void reset_runtime_maps(int32_t n_layer, int32_t n_expert, int32_t slot_count, int32_t bootstrap);
         void reset_step_counters();
     };
 

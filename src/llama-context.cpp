@@ -31,18 +31,20 @@
 #include <vector>
 #include <map>
 
-void llama_context::moe_slot_runtime_state::reset_runtime_maps(int32_t n_layer, int32_t n_expert, int32_t slot_count, bool seed) {
+void llama_context::moe_slot_runtime_state::reset_runtime_maps(int32_t n_layer, int32_t n_expert, int32_t slot_count, int32_t bootstrap) {
     n_expert_per_layer = std::max(0, n_expert);
     gid_to_slot.clear();
     slot_to_gid.assign(std::max(0, slot_count), -1);
     slot_state.assign(slot_to_gid.size(), SLOT_EMPTY);
     expert_to_slot.assign(std::max(0, n_layer), std::vector<int>(std::max(0, n_expert), -1));
 
-    if (seed) {
+    if (bootstrap == 0 || bootstrap == 2) {
         const int total_gids = std::max(0, n_layer) * std::max(0, n_expert);
         const int n_seed = std::min((int) slot_to_gid.size(), total_gids);
-        for (int gid = 0; gid < n_seed; ++gid) {
-            const int slot = gid;
+        const int gid0 = bootstrap == 2 ? total_gids - n_seed : 0;
+        for (int i = 0; i < n_seed; ++i) {
+            const int slot = i;
+            const int gid = gid0 + i;
             const int il = n_expert > 0 ? gid / n_expert : 0;
             const int ie = n_expert > 0 ? gid % n_expert : 0;
             slot_to_gid[slot] = gid;
@@ -290,7 +292,7 @@ static void configure_moe_slot_planner(
 
     if (!rt.enabled) {
         rt.planner.reset();
-        rt.reset_runtime_maps(hparams.n_layer, hparams.n_expert, 0, false);
+        rt.reset_runtime_maps(hparams.n_layer, hparams.n_expert, 0, 1);
         rt.layer_expert_slice_bytes.assign((size_t) hparams.n_layer, 0);
         rt.tensor_groups.clear();
         return;
@@ -313,7 +315,7 @@ static void configure_moe_slot_planner(
     if (cparams.moe_slot_bootstrap == 1) {
         rt.planner.clear_slots();
     }
-    rt.reset_runtime_maps(hparams.n_layer, hparams.n_expert, cparams.moe_slot_count, cparams.moe_slot_bootstrap == 0);
+    rt.reset_runtime_maps(hparams.n_layer, hparams.n_expert, cparams.moe_slot_count, cparams.moe_slot_bootstrap);
 
     struct group_key {
         std::string family;
@@ -587,7 +589,7 @@ static void configure_moe_slot_planner(
         cfg.top_k,
         cfg.n_global_slots,
         cfg.max_fills_per_token,
-        cparams.moe_slot_bootstrap == 0 ? "seed" : "empty",
+        cparams.moe_slot_bootstrap == 0 ? "seed" : cparams.moe_slot_bootstrap == 2 ? "tail" : "empty",
         cparams.moe_slot_prefill == 0 ? "freeze" : "observe",
         cparams.moe_slot_log);
     LLAMA_LOG_INFO("%s: moe slot plan groups=%zu total_slot_bank_bytes=%" PRIu64 "\n",

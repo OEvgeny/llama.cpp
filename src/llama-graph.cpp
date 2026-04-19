@@ -1005,7 +1005,7 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
         GGML_ASSERT(ids_mm->ne[3] == 1);
 
         const int64_t n_tokens = ids_mm->ne[2];
-        const int64_t n_expert_used = ggml_nelements(ids_mm) / n_tokens;
+        const int64_t n_expert_used = n_tokens == 0 ? ids_mm->ne[0] * ids_mm->ne[1] : ggml_nelements(ids_mm) / n_tokens;
         ids_mm = ggml_reshape_2d(ctx0, ids_mm, n_expert_used, n_tokens);
     }
 
@@ -1045,7 +1045,7 @@ ggml_tensor * llm_graph_context::build_lora_mm_id_cond(
         GGML_ASSERT(ids_mm->ne[3] == 1);
 
         const int64_t n_tokens = ids_mm->ne[2];
-        const int64_t n_expert_used = ggml_nelements(ids_mm) / n_tokens;
+        const int64_t n_expert_used = n_tokens == 0 ? ids_mm->ne[0] * ids_mm->ne[1] : ggml_nelements(ids_mm) / n_tokens;
         ids_mm = ggml_reshape_2d(ctx0, ids_mm, n_expert_used, n_tokens);
     }
 
@@ -1499,7 +1499,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             if (selected_slots->type != GGML_TYPE_I32) {
                 selected_slots = ggml_cast(ctx0, selected_slots, GGML_TYPE_I32);
             }
-            selected_slots = ggml_reshape_2d(ctx0, selected_slots, selected_experts->ne[0], selected_experts->ne[1]);
             cb(selected_slots, "ffn_moe_slots_clamped", il);
         }
     }
