@@ -667,13 +667,12 @@ static bool moe_selected_experts_eval_cb(struct ggml_tensor * t, bool ask, void 
         return false;
     }
 
-    // Scheduler is asking whether we want to observe this node.
-    if (ask) {
+    const int il = parse_moe_layer_from_name(t->name);
+    if (il < 0) {
         return true;
     }
 
-    const int il = parse_moe_layer_from_name(t->name);
-    if (il < 0) {
+    if (ask) {
         return true;
     }
 

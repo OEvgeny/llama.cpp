@@ -1481,8 +1481,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             expert_to_slot_rows = ggml_repeat_4d(ctx0, expert_to_slot_rows, 1, expert_to_slot_rows->ne[1], selected_experts->ne[1], 1); // [1, n_expert, n_tokens]
         }
         selected_slots = ggml_get_rows(ctx0, expert_to_slot_rows, selected_experts); // [1, n_expert_used, n_tokens]
-        selected_slots = ggml_reshape_2d(ctx0, selected_slots, selected_experts->ne[0], selected_experts->ne[1]);
-        cb(selected_slots, "ffn_moe_slots", il);
 
         ggml_tensor * selected_slots_f32 = ggml_cast(ctx0, selected_slots, GGML_TYPE_F32);
         ggml_tensor * missing_mask = ggml_step(ctx0, ggml_neg(ctx0, selected_slots_f32));
