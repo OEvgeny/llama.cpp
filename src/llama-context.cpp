@@ -120,6 +120,73 @@ static bool moe_slot_is_ready(const llama_context::moe_slot_runtime_state & rt, 
     return slot >= 0 && slot < (int) rt.slot_state.size() && rt.slot_state[slot] == llama_context::moe_slot_runtime_state::SLOT_READY;
 }
 
+static void moe_set_expert_slot(llama_context::moe_slot_runtime_state & rt, int gid, int slot) {
+    if (rt.n_expert_per_layer <= 0) {
+        return;
+    }
+
+    const int layer = gid / rt.n_expert_per_layer;
+    const int expert = gid % rt.n_expert_per_layer;
+    if (layer >= 0 && layer < (int) rt.expert_to_slot.size() &&
+        expert >= 0 && expert < (int) rt.expert_to_slot[layer].size()) {
+        rt.expert_to_slot[layer][expert] = slot;
+    }
+}
+
+struct moe_runtime_residency {
+    int selected = 0;
+    int resident = 0;
+    int missing = 0;
+    int gpu_hit_layers = 0;
+    int cpu_fallback_layers = 0;
+};
+
+static moe_runtime_residency moe_count_runtime_residency(const llama_context::moe_slot_runtime_state & rt) {
+    moe_runtime_residency res;
+
+    for (const auto & kv : rt.selected_experts_host) {
+        const int il = kv.first;
+        if (il < 0 || il >= (int) rt.expert_to_slot.size()) {
+            continue;
+        }
+
+        bool all_ready = true;
+        for (int32_t e : kv.second) {
+            if (e < 0 || e >= (int) rt.expert_to_slot[il].size()) {
+                all_ready = false;
+                continue;
+            }
+
+            ++res.selected;
+            const int slot = rt.expert_to_slot[il][e];
+            if (moe_slot_is_ready(rt, slot)) {
+                ++res.resident;
+            } else {
+                ++res.missing;
+                all_ready = false;
+            }
+        }
+
+        if (all_ready && !kv.second.empty()) {
+            ++res.gpu_hit_layers;
+        } else {
+            ++res.cpu_fallback_layers;
+        }
+    }
+
+    return res;
+}
+
+static void moe_sync_planner_slots_from_runtime(llama_context::moe_slot_runtime_state & rt) {
+    std::vector<int> ready_slot_to_gid = rt.slot_to_gid;
+    for (size_t slot = 0; slot < ready_slot_to_gid.size(); ++slot) {
+        if (!moe_slot_is_ready(rt, (int) slot)) {
+            ready_slot_to_gid[slot] = -1;
+        }
+    }
+    rt.planner.sync_slots(ready_slot_to_gid);
+}
+
 static void moe_sync_expert_to_slot_tensors(llama_context::moe_slot_runtime_state & rt) {
     for (size_t il = 0; il < rt.layer_expert_to_slot_tensors.size(); ++il) {
         ggml_tensor * t = rt.layer_expert_to_slot_tensors[il];
@@ -510,6 +577,7 @@ static void configure_moe_slot_planner(
         }
     }
     moe_sync_expert_to_slot_tensors(rt);
+    moe_sync_planner_slots_from_runtime(rt);
 
     LLAMA_LOG_INFO(
         "%s: enabled n_layers=%d n_expert=%d top_k=%d slots=%d moves=%d bootstrap=%s prefill=%s log=%d\n",
@@ -640,7 +708,7 @@ static bool moe_selected_experts_eval_cb(struct ggml_tensor * t, bool ask, void 
 static void apply_moe_slot_plan(
         llama_context::moe_slot_runtime_state & rt,
         const llama_moe_plan::TokenPlan & plan) {
-    rt.token_counters.moves_applied = (int32_t) plan.fills.size();
+    rt.token_counters.moves_applied = 0;
     rt.token_counters.copy_failures = 0;
 
     for (const auto & fill : plan.fills) {
@@ -648,24 +716,39 @@ static void apply_moe_slot_plan(
             continue;
         }
 
+        int existing_slot = -1;
+        llama_context::moe_slot_runtime_state::slot_readiness existing_state = llama_context::moe_slot_runtime_state::SLOT_EMPTY;
+        const auto existing_it = rt.gid_to_slot.find(fill.gid);
+        if (existing_it != rt.gid_to_slot.end()) {
+            existing_slot = existing_it->second;
+            if (existing_slot >= 0 && existing_slot < (int) rt.slot_state.size()) {
+                existing_state = rt.slot_state[existing_slot];
+            }
+        }
+
         const int old_gid = rt.slot_to_gid[fill.slot];
         const llama_context::moe_slot_runtime_state::slot_readiness old_state = rt.slot_state[fill.slot];
+        if (old_gid == fill.gid && old_state == llama_context::moe_slot_runtime_state::SLOT_READY) {
+            continue;
+        }
+
+        if (existing_slot >= 0 && existing_slot != fill.slot && existing_slot < (int) rt.slot_to_gid.size()) {
+            rt.slot_to_gid[existing_slot] = -1;
+            rt.slot_state[existing_slot] = llama_context::moe_slot_runtime_state::SLOT_EMPTY;
+            rt.gid_to_slot.erase(fill.gid);
+            moe_set_expert_slot(rt, fill.gid, -1);
+        }
+
         rt.slot_state[fill.slot] = llama_context::moe_slot_runtime_state::SLOT_PENDING_FILL;
 
         if (old_gid >= 0) {
             rt.gid_to_slot.erase(old_gid);
-            const int old_layer = rt.n_expert_per_layer > 0 ? old_gid / rt.n_expert_per_layer : -1;
-            const int old_expert = rt.n_expert_per_layer > 0 ? old_gid % rt.n_expert_per_layer : -1;
-            if (old_layer >= 0 && old_layer < (int) rt.expert_to_slot.size() && old_expert >= 0 && old_expert < (int) rt.expert_to_slot[old_layer].size()) {
-                rt.expert_to_slot[old_layer][old_expert] = -1;
-            }
+            moe_set_expert_slot(rt, old_gid, -1);
         }
 
         rt.slot_to_gid[fill.slot] = fill.gid;
         rt.gid_to_slot[fill.gid] = fill.slot;
-        if (fill.layer >= 0 && fill.layer < (int) rt.expert_to_slot.size() && fill.expert >= 0 && fill.expert < (int) rt.expert_to_slot[fill.layer].size()) {
-            rt.expert_to_slot[fill.layer][fill.expert] = fill.slot;
-        }
+        moe_set_expert_slot(rt, fill.gid, fill.slot);
 
         bool copy_ok = true;
         bool wrote_any = false;
@@ -704,31 +787,33 @@ static void apply_moe_slot_plan(
         if (copy_ok) {
             rt.slot_state[fill.slot] = llama_context::moe_slot_runtime_state::SLOT_READY;
             rt.token_counters.copy_bytes += bytes_copied;
+            rt.token_counters.moves_applied++;
         } else {
             rt.token_counters.copy_failures++;
             if (!wrote_any && old_gid >= 0) {
                 // restore logical mapping when no writes occurred
                 rt.slot_to_gid[fill.slot] = old_gid;
                 rt.gid_to_slot[old_gid] = fill.slot;
-                const int old_layer = rt.n_expert_per_layer > 0 ? old_gid / rt.n_expert_per_layer : -1;
-                const int old_expert = rt.n_expert_per_layer > 0 ? old_gid % rt.n_expert_per_layer : -1;
-                if (old_layer >= 0 && old_layer < (int) rt.expert_to_slot.size() && old_expert >= 0 && old_expert < (int) rt.expert_to_slot[old_layer].size()) {
-                    rt.expert_to_slot[old_layer][old_expert] = fill.slot;
-                }
+                moe_set_expert_slot(rt, old_gid, fill.slot);
                 rt.slot_state[fill.slot] = old_state;
             } else {
                 rt.slot_to_gid[fill.slot] = -1;
                 rt.slot_state[fill.slot] = llama_context::moe_slot_runtime_state::SLOT_EMPTY;
                 rt.gid_to_slot.erase(fill.gid);
-                if (fill.layer >= 0 && fill.layer < (int) rt.expert_to_slot.size() && fill.expert >= 0 && fill.expert < (int) rt.expert_to_slot[fill.layer].size()) {
-                    rt.expert_to_slot[fill.layer][fill.expert] = -1;
-                }
+                moe_set_expert_slot(rt, fill.gid, -1);
+            }
+            if (existing_slot >= 0 && existing_slot != fill.slot && existing_slot < (int) rt.slot_to_gid.size()) {
+                rt.slot_to_gid[existing_slot] = fill.gid;
+                rt.slot_state[existing_slot] = existing_state;
+                rt.gid_to_slot[fill.gid] = existing_slot;
+                moe_set_expert_slot(rt, fill.gid, existing_slot);
             }
             LLAMA_LOG_WARN("%s: moe slot copy failed for layer=%d expert=%d slot=%d\n", __func__, fill.layer, fill.expert, fill.slot);
         }
     }
     rt.token_counters.pending_slots = (int32_t) moe_count_pending_slots(rt);
     moe_sync_expert_to_slot_tensors(rt);
+    moe_sync_planner_slots_from_runtime(rt);
 }
 
 static void update_moe_layer_routing_counters(
@@ -2479,14 +2564,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
         if (moe_slot_runtime.enabled) {
             if (ubatch.n_tokens > 1) {
                 if (!moe_slot_runtime.in_prefill) {
-                    moe_slot_runtime.planner.reset();
+                    moe_slot_runtime.planner.reset_history_keep_slots();
+                    moe_sync_planner_slots_from_runtime(moe_slot_runtime);
                     moe_slot_runtime.planner_token_index = 0;
                 }
                 moe_slot_runtime.in_prefill = true;
             } else if (ubatch.n_tokens == 1 && moe_slot_runtime.in_prefill) {
                 moe_slot_runtime.prev_selected_experts.clear();
                 moe_slot_runtime.selected_experts_host.clear();
-                moe_slot_runtime.planner.reset();
+                moe_slot_runtime.planner.reset_history_keep_slots();
+                moe_sync_planner_slots_from_runtime(moe_slot_runtime);
                 moe_slot_runtime.planner_token_index = 0;
                 moe_slot_runtime.in_prefill = false;
             }
@@ -2512,9 +2599,25 @@ int llama_context::decode(const llama_batch & batch_inp) {
         const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_DECODER, mctx.get(), status);
 
         if (planner_active_step) {
-            auto plan = moe_slot_runtime.planner.finish_decode_step_and_get_plan();
-            apply_moe_slot_plan(moe_slot_runtime, plan);
             update_moe_layer_routing_counters(moe_slot_runtime);
+            auto plan = moe_slot_runtime.planner.finish_decode_step_and_get_plan();
+            const auto runtime_residency = moe_count_runtime_residency(moe_slot_runtime);
+            if (moe_slot_runtime.planner_log >= 1 &&
+                    (runtime_residency.selected != plan.total_selected ||
+                     runtime_residency.resident != plan.total_resident ||
+                     runtime_residency.missing != plan.total_missing)) {
+                LLAMA_LOG_WARN("%s: moe slot residency mismatch planner selected=%d resident=%d missing=%d runtime selected=%d resident=%d missing=%d runtime_gpu_hit_layers=%d runtime_cpu_fallback_layers=%d\n",
+                    __func__,
+                    plan.total_selected,
+                    plan.total_resident,
+                    plan.total_missing,
+                    runtime_residency.selected,
+                    runtime_residency.resident,
+                    runtime_residency.missing,
+                    runtime_residency.gpu_hit_layers,
+                    runtime_residency.cpu_fallback_layers);
+            }
+            apply_moe_slot_plan(moe_slot_runtime, plan);
 
             if (moe_slot_runtime.planner_log >= 2) {
                 LLAMA_LOG_INFO("%s: observed_layers_this_step=%zu\n", __func__, moe_eval_ctx.observed_layers_this_step);

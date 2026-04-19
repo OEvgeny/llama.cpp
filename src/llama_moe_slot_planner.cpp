@@ -175,9 +175,38 @@ public:
         layer_prev_selected_.clear();
     }
 
+    void reset_history_keep_slots() {
+        token_steps_.clear();
+        current_step_.clear();
+        current_token_index_ = -1;
+        gid_last_seen_.clear();
+        gid_freq_.clear();
+        recent_steps_per_gid_.clear();
+        layer_jaccard_hist_.clear();
+        layer_prev_selected_.clear();
+    }
+
     void clear_slots() {
         gid_to_slot_.clear();
         std::fill(slot_to_gid_.begin(), slot_to_gid_.end(), -1);
+    }
+
+    void sync_slots(const std::vector<int> & slot_to_gid) {
+        slot_to_gid_.assign(std::max(0, cfg_.n_global_slots), -1);
+        gid_to_slot_.clear();
+
+        const int n = std::min((int) slot_to_gid_.size(), (int) slot_to_gid.size());
+        for (int slot = 0; slot < n; ++slot) {
+            const int gid = slot_to_gid[slot];
+            if (gid < 0 || gid >= cfg_.n_layers * cfg_.n_experts_per_layer) {
+                continue;
+            }
+            if (gid_to_slot_.find(gid) != gid_to_slot_.end()) {
+                continue;
+            }
+            slot_to_gid_[slot] = gid;
+            gid_to_slot_[gid] = slot;
+        }
     }
 
     const Config & config() const { return cfg_; }
@@ -367,6 +396,7 @@ private:
 
     int choose_victim_gid_with_state(
             const std::unordered_set<int> & reserved,
+            const std::unordered_set<int> & protected_gids,
             const std::vector<int> & temp_slot_to_gid) const {
         int victim = -1;
         double best = std::numeric_limits<double>::infinity();
@@ -376,6 +406,7 @@ private:
                 const int gid = temp_slot_to_gid[slot];
                 if (gid < 0) continue;
                 if (reserved.find(gid) != reserved.end()) continue;
+                if (protected_gids.find(gid) != protected_gids.end()) continue;
 
                 const bool protected_recent = gid_seen_recently(gid, cfg_.protect_recent_steps);
                 if (pass == 0 && protected_recent) continue;
@@ -403,20 +434,25 @@ private:
     std::vector<FillDecision> choose_fills(const std::vector<LayerPlanSummary> & layers) const {
         std::vector<Candidate> cands;
         cands.reserve(cfg_.n_layers * std::max(1, cfg_.top_k));
+        std::unordered_set<int> current_selected_gids;
 
         for (const auto & ls : layers) {
-            if (!ls.stable_enough) {
-                continue;
+            for (int e : ls.selected_experts) {
+                current_selected_gids.insert(make_gid(ls.layer, e));
             }
+
             if (ls.missing_count == 0) {
                 continue;
             }
 
             const double completeness = (double) ls.resident_count / std::max(1, ls.selected_count);
-            const int closeness = ls.resident_count;
+            const double missing_fraction = (double) ls.missing_count / std::max(1, ls.selected_count);
             const double layer_base =
-                cfg_.score_layer_stability * ls.stability +
-                cfg_.score_completeness * (1.0 + completeness + 0.25 * closeness);
+                // Any current miss can force CPU fallback for the whole layer. Make
+                // cold layers eligible, then use stability/completeness as tie-breaks.
+                8.0 * missing_fraction +
+                cfg_.score_completeness * (1.0 + completeness) +
+                (ls.stable_enough ? cfg_.score_layer_stability * ls.stability : 0.0);
 
             for (int e : ls.missing_experts) {
                 const int gid = make_gid(ls.layer, e);
@@ -435,7 +471,7 @@ private:
                 c.score += cfg_.score_current_presence;
 
                 std::ostringstream why;
-                why << "stable_layer=" << ls.layer
+                why << (ls.stable_enough ? "stable_layer=" : "coverage_layer=") << ls.layer
                     << " stability=" << ls.stability
                     << " resident=" << ls.resident_count
                     << "/" << ls.selected_count
@@ -487,7 +523,7 @@ private:
                 continue;
             }
 
-            const int victim_gid = choose_victim_gid_with_state(reserved_gids, temp_slot_to_gid);
+            const int victim_gid = choose_victim_gid_with_state(reserved_gids, current_selected_gids, temp_slot_to_gid);
             if (victim_gid < 0) {
                 continue;
             }
