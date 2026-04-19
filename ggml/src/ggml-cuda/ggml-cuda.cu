@@ -2393,6 +2393,20 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
+    const ggml_tensor * cond = dst->src[3];
+
+    if (cond != nullptr) {
+        GGML_ASSERT(cond->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_nelements(cond) == 1);
+
+        float cond_value = 0.0f;
+        CUDA_CHECK(cudaMemcpyAsync(&cond_value, cond->data, sizeof(cond_value), cudaMemcpyDeviceToHost, ctx.stream()));
+        CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+        if (cond_value <= 0.0f) {
+            CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), ctx.stream()));
+            return;
+        }
+    }
 
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);

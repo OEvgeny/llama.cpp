@@ -14,6 +14,9 @@
 
 // ggml_compute_forward_dup
 
+using std::isinf;
+using std::isnan;
+
 static void ggml_compute_forward_dup_same_cont(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -11212,3 +11215,4 @@ void ggml_compute_forward_opt_step_sgd(const ggml_compute_params * params, ggml_
             }
     }
 }
+

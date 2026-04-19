@@ -1519,6 +1519,20 @@ static void ggml_compute_forward_mul_mat_id(
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
     const struct ggml_tensor * ids = dst->src[2];
+    const struct ggml_tensor * cond = dst->src[3];
+
+    if (cond != NULL) {
+        GGML_ASSERT(cond->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_nelements(cond) == 1);
+
+        const float cond_value = *(const float *) cond->data;
+        if (cond_value <= 0.0f) {
+            if (params->ith == 0) {
+                memset(dst->data, 0, ggml_nbytes(dst));
+            }
+            return;
+        }
+    }
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
