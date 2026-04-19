@@ -96,8 +96,11 @@ struct llama_context {
 
         std::unordered_map<int, int> gid_to_slot;
         std::vector<int> slot_to_gid;
-        std::vector<std::vector<int>> expert_to_slot;
+        std::vector<std::vector<int>> expert_to_global_slot;
+        std::vector<std::vector<int>> expert_to_slot; // graph-facing local slot ids within each layer slab
         std::vector<slot_readiness> slot_state;
+        std::vector<int> layer_slot_base;
+        std::vector<int> layer_slot_capacity;
 
         std::vector<int64_t> layer_gpu_hit;
         std::vector<int64_t> layer_cpu_fallback;

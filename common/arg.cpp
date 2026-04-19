@@ -2340,13 +2340,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_SLOT_MOVES"));
     add_opt(common_arg(
-        {"--moe-slot-bootstrap"}, "{seed,empty}",
+        {"--moe-slot-bootstrap"}, "{seed,empty,tail}",
         "startup policy for MoE slot cache",
         [](common_params & params, const std::string & value) {
             if (value == "seed") {
                 params.moe_slot_bootstrap = COMMON_MOE_SLOT_BOOTSTRAP_SEED;
             } else if (value == "empty") {
                 params.moe_slot_bootstrap = COMMON_MOE_SLOT_BOOTSTRAP_EMPTY;
+            } else if (value == "tail") {
+                params.moe_slot_bootstrap = COMMON_MOE_SLOT_BOOTSTRAP_TAIL;
             } else {
                 throw std::invalid_argument("invalid value");
             }

@@ -31,27 +31,81 @@
 #include <vector>
 #include <map>
 
+static int32_t llama_env_i32(const char * name, int32_t default_value) {
+    const char * value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return default_value;
+    }
+    char * end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    if (end == value) {
+        return default_value;
+    }
+    return (int32_t) parsed;
+}
+
+static std::pair<int, int> llama_moe_layer_slot_range(int32_t n_layer, int32_t slot_count, int32_t layer, int32_t capacity, int32_t stride) {
+    if (capacity > 0) {
+        capacity = std::min(capacity, std::max<int32_t>(0, slot_count));
+        if (capacity <= 0) {
+            return { 0, 0 };
+        }
+        stride = stride > 0 ? stride : capacity;
+        int base = (int) (((int64_t) layer * stride) % std::max<int32_t>(1, slot_count));
+        if (base + capacity > slot_count) {
+            base = std::max<int32_t>(0, slot_count - capacity);
+        }
+        return { base, capacity };
+    }
+
+    const int64_t base = (int64_t) slot_count * layer / std::max<int32_t>(n_layer, 1);
+    const int64_t next = (int64_t) slot_count * (layer + 1) / std::max<int32_t>(n_layer, 1);
+    return { (int) base, (int) std::max<int64_t>(0, next - base) };
+}
+
 void llama_context::moe_slot_runtime_state::reset_runtime_maps(int32_t n_layer, int32_t n_expert, int32_t slot_count, int32_t bootstrap) {
     n_expert_per_layer = std::max(0, n_expert);
     gid_to_slot.clear();
     slot_to_gid.assign(std::max(0, slot_count), -1);
     slot_state.assign(slot_to_gid.size(), SLOT_EMPTY);
+    const int32_t env_layer_capacity = llama_env_i32("LLAMA_MOE_SLOT_LAYER_CAPACITY", 0);
+    const int32_t env_layer_stride = llama_env_i32("LLAMA_MOE_SLOT_LAYER_STRIDE", 0);
+    layer_slot_base.assign(std::max(0, n_layer), 0);
+    layer_slot_capacity.assign(std::max(0, n_layer), 0);
+    for (int32_t il = 0; il < n_layer; ++il) {
+        const auto [base, capacity] = llama_moe_layer_slot_range(n_layer, slot_count, il, env_layer_capacity, env_layer_stride);
+        layer_slot_base[(size_t) il] = base;
+        layer_slot_capacity[(size_t) il] = capacity;
+    }
+    expert_to_global_slot.assign(std::max(0, n_layer), std::vector<int>(std::max(0, n_expert), -1));
     expert_to_slot.assign(std::max(0, n_layer), std::vector<int>(std::max(0, n_expert), -1));
 
     if (bootstrap == 0 || bootstrap == 2) {
-        const int total_gids = std::max(0, n_layer) * std::max(0, n_expert);
-        const int n_seed = std::min((int) slot_to_gid.size(), total_gids);
-        const int gid0 = bootstrap == 2 ? total_gids - n_seed : 0;
-        for (int i = 0; i < n_seed; ++i) {
-            const int slot = i;
-            const int gid = gid0 + i;
-            const int il = n_expert > 0 ? gid / n_expert : 0;
-            const int ie = n_expert > 0 ? gid % n_expert : 0;
-            slot_to_gid[slot] = gid;
-            slot_state[slot] = SLOT_READY;
-            gid_to_slot[gid] = slot;
-            if (il >= 0 && il < (int) expert_to_slot.size() && ie >= 0 && ie < (int) expert_to_slot[il].size()) {
-                expert_to_slot[il][ie] = slot;
+        for (int32_t il = 0; il < n_layer; ++il) {
+            const int base = layer_slot_base[(size_t) il];
+            const int capacity = layer_slot_capacity[(size_t) il];
+            const int n_seed = std::min(capacity, std::max(0, n_expert));
+            const int expert0 = bootstrap == 2 ? std::max(0, n_expert - n_seed) : 0;
+            for (int i = 0; i < n_seed; ++i) {
+                const int slot = base + i;
+                const int ie = expert0 + i;
+                const int gid = il * n_expert + ie;
+                const int old_gid = slot >= 0 && slot < (int) slot_to_gid.size() ? slot_to_gid[(size_t) slot] : -1;
+                if (old_gid >= 0) {
+                    gid_to_slot.erase(old_gid);
+                    const int old_layer = n_expert > 0 ? old_gid / n_expert : -1;
+                    const int old_expert = n_expert > 0 ? old_gid % n_expert : -1;
+                    if (old_layer >= 0 && old_layer < (int) expert_to_slot.size() &&
+                            old_expert >= 0 && old_expert < (int) expert_to_slot[(size_t) old_layer].size()) {
+                        expert_to_global_slot[(size_t) old_layer][(size_t) old_expert] = -1;
+                        expert_to_slot[(size_t) old_layer][(size_t) old_expert] = -1;
+                    }
+                }
+                slot_to_gid[slot] = gid;
+                slot_state[slot] = SLOT_READY;
+                gid_to_slot[gid] = slot;
+                expert_to_global_slot[(size_t) il][(size_t) ie] = slot;
+                expert_to_slot[(size_t) il][(size_t) ie] = i;
             }
         }
     }
@@ -131,7 +185,16 @@ static void moe_set_expert_slot(llama_context::moe_slot_runtime_state & rt, int 
     const int expert = gid % rt.n_expert_per_layer;
     if (layer >= 0 && layer < (int) rt.expert_to_slot.size() &&
         expert >= 0 && expert < (int) rt.expert_to_slot[layer].size()) {
-        rt.expert_to_slot[layer][expert] = slot;
+        rt.expert_to_global_slot[layer][expert] = slot;
+        int local_slot = -1;
+        if (slot >= 0 && layer < (int) rt.layer_slot_base.size() && layer < (int) rt.layer_slot_capacity.size()) {
+            const int base = rt.layer_slot_base[layer];
+            const int capacity = rt.layer_slot_capacity[layer];
+            if (slot >= base && slot < base + capacity) {
+                local_slot = slot - base;
+            }
+        }
+        rt.expert_to_slot[layer][expert] = local_slot;
     }
 }
 
@@ -148,19 +211,19 @@ static moe_runtime_residency moe_count_runtime_residency(const llama_context::mo
 
     for (const auto & kv : rt.selected_experts_host) {
         const int il = kv.first;
-        if (il < 0 || il >= (int) rt.expert_to_slot.size()) {
+        if (il < 0 || il >= (int) rt.expert_to_global_slot.size()) {
             continue;
         }
 
         bool all_ready = true;
         for (int32_t e : kv.second) {
-            if (e < 0 || e >= (int) rt.expert_to_slot[il].size()) {
+            if (e < 0 || e >= (int) rt.expert_to_global_slot[il].size()) {
                 all_ready = false;
                 continue;
             }
 
             ++res.selected;
-            const int slot = rt.expert_to_slot[il][e];
+            const int slot = rt.expert_to_global_slot[il][e];
             if (moe_slot_is_ready(rt, slot)) {
                 ++res.resident;
             } else {
@@ -221,11 +284,18 @@ static void moe_assert_slot_map_consistency(
         if (rt.n_expert_per_layer > 0) {
             const int layer = gid / rt.n_expert_per_layer;
             const int expert = gid % rt.n_expert_per_layer;
-            if (layer >= 0 && layer < (int) rt.expert_to_slot.size() &&
-                expert >= 0 && expert < (int) rt.expert_to_slot[layer].size()) {
-                if (rt.expert_to_slot[layer][expert] != (int) slot) {
-                    GGML_ABORT("moe slot invariant failed (%s): token=%d layer=%d expert_to_slot mismatch gid=%d expected_slot=%d found_slot=%d",
-                        when, planner_token_index, il, gid, (int) slot, rt.expert_to_slot[layer][expert]);
+            if (layer >= 0 && layer < (int) rt.expert_to_global_slot.size() &&
+                expert >= 0 && expert < (int) rt.expert_to_global_slot[layer].size()) {
+                if (rt.expert_to_global_slot[layer][expert] != (int) slot) {
+                    GGML_ABORT("moe slot invariant failed (%s): token=%d layer=%d expert_to_global_slot mismatch gid=%d expected_slot=%d found_slot=%d",
+                        when, planner_token_index, il, gid, (int) slot, rt.expert_to_global_slot[layer][expert]);
+                }
+                const int base = layer < (int) rt.layer_slot_base.size() ? rt.layer_slot_base[layer] : 0;
+                const int capacity = layer < (int) rt.layer_slot_capacity.size() ? rt.layer_slot_capacity[layer] : 0;
+                const int expected_local = (slot >= (size_t) base && slot < (size_t) (base + capacity)) ? (int) slot - base : -1;
+                if (rt.expert_to_slot[layer][expert] != expected_local) {
+                    GGML_ABORT("moe slot invariant failed (%s): token=%d layer=%d expert_to_slot local mismatch gid=%d expected_local=%d found_local=%d",
+                        when, planner_token_index, il, gid, expected_local, rt.expert_to_slot[layer][expert]);
                 }
             }
         }
@@ -309,6 +379,8 @@ static void configure_moe_slot_planner(
     cfg.stability_window = cparams.moe_slot_stability_window;
     cfg.stability_threshold = cparams.moe_slot_stability_threshold;
     cfg.protect_recent_steps = cparams.moe_slot_protect_recent;
+    cfg.layer_slot_capacity = llama_env_i32("LLAMA_MOE_SLOT_LAYER_CAPACITY", 0);
+    cfg.layer_slot_stride = llama_env_i32("LLAMA_MOE_SLOT_LAYER_STRIDE", 0);
 
     rt.planner.reconfigure(cfg);
 
@@ -469,7 +541,7 @@ static void configure_moe_slot_planner(
         }
 
         ggml_init_params params_ctx = {
-            /*.mem_size   =*/ ggml_tensor_overhead(),
+            /*.mem_size   =*/ ggml_tensor_overhead() * (1 + g.layers.size()),
             /*.mem_buffer =*/ nullptr,
             /*.no_alloc   =*/ true,
         };
@@ -489,6 +561,9 @@ static void configure_moe_slot_planner(
         if (!slot_buf) {
             throw std::runtime_error(format("moe slot cache: failed to allocate slot bank for group '%s' (%" PRIu64 " bytes)", g.family.c_str(), slot_bank_bytes));
         }
+        // Slot banks hold quantized expert weights and are consumed like model weights by mul_mat_id.
+        // Marking them as weights keeps backend scheduling/padding handling on the same path as loaded tensors.
+        ggml_backend_buffer_set_usage(slot_buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         rt.slot_bank_buf.emplace_back(std::move(slot_buf));
     }
     rt.copy_scratch.resize((size_t) max_single_expert_bytes);
@@ -519,11 +594,24 @@ static void configure_moe_slot_planner(
         if (il < 0 || il >= (int32_t) rt.layer_sources.size()) {
             return nullptr;
         }
+        if (il >= (int32_t) rt.layer_slot_base.size() || il >= (int32_t) rt.layer_slot_capacity.size()) {
+            return nullptr;
+        }
         const auto & src = rt.layer_sources[il][family];
         if (src.group_id < 0 || src.group_id >= (int32_t) rt.tensor_groups.size()) {
             return nullptr;
         }
-        return rt.tensor_groups[src.group_id].slot_bank_tensor;
+        auto & group = rt.tensor_groups[src.group_id];
+        ggml_tensor * bank = group.slot_bank_tensor;
+        const int base = rt.layer_slot_base[(size_t) il];
+        const int capacity = rt.layer_slot_capacity[(size_t) il];
+        if (!bank || capacity <= 0 || base < 0 || base + capacity > bank->ne[2]) {
+            return nullptr;
+        }
+        return ggml_view_4d(rt.slot_bank_ctx[(size_t) src.group_id].get(), bank,
+                bank->ne[0], bank->ne[1], capacity, bank->ne[3],
+                bank->nb[1], bank->nb[2], bank->nb[3],
+                (size_t) base * bank->nb[2]);
     };
     for (int32_t il = 0; il < hparams.n_layer; ++il) {
         rt.layer_slot_up_exps[(size_t) il]      = get_slot_group_tensor(il, llama_context::moe_slot_runtime_state::MOE_FAMILY_UP_EXPS);
@@ -574,6 +662,7 @@ static void configure_moe_slot_planner(
                 rt.gid_to_slot.erase(gid);
                 if (il >= 0 && il < (int) rt.expert_to_slot.size() && ie >= 0 && ie < (int) rt.expert_to_slot[il].size()) {
                     rt.expert_to_slot[il][ie] = -1;
+                    rt.expert_to_global_slot[il][ie] = -1;
                 }
             }
         }
@@ -592,6 +681,10 @@ static void configure_moe_slot_planner(
         cparams.moe_slot_bootstrap == 0 ? "seed" : cparams.moe_slot_bootstrap == 2 ? "tail" : "empty",
         cparams.moe_slot_prefill == 0 ? "freeze" : "observe",
         cparams.moe_slot_log);
+    if (cfg.layer_slot_capacity > 0) {
+        LLAMA_LOG_INFO("%s: moe slot layer layout capacity=%d stride=%d (overlap allowed)\n",
+            __func__, cfg.layer_slot_capacity, cfg.layer_slot_stride > 0 ? cfg.layer_slot_stride : cfg.layer_slot_capacity);
+    }
     LLAMA_LOG_INFO("%s: moe slot plan groups=%zu total_slot_bank_bytes=%" PRIu64 "\n",
         __func__, rt.tensor_groups.size(), total_slot_bank_bytes);
 
@@ -825,7 +918,7 @@ static void update_moe_layer_routing_counters(
 
     for (const auto & kv : rt.selected_experts_host) {
         const int il = kv.first;
-        if (il < 0 || il >= (int) rt.expert_to_slot.size()) {
+        if (il < 0 || il >= (int) rt.expert_to_global_slot.size()) {
             continue;
         }
 
@@ -836,11 +929,11 @@ static void update_moe_layer_routing_counters(
         std::unordered_map<int, int32_t> slot_to_expert;
         bool all_ready = true;
         for (int32_t e : kv.second) {
-            if (e < 0 || e >= (int) rt.expert_to_slot[il].size()) {
+            if (e < 0 || e >= (int) rt.expert_to_global_slot[il].size()) {
                 all_ready = false;
                 break;
             }
-            const int slot = rt.expert_to_slot[il][e];
+            const int slot = rt.expert_to_global_slot[il][e];
             if (slot >= 0) {
                 const auto ins = slot_to_expert.emplace(slot, e);
                 if (!ins.second && ins.first->second != e && rt.planner_log >= 2) {

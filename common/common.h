@@ -382,6 +382,7 @@ struct common_params_diffusion {
 enum common_moe_slot_bootstrap {
     COMMON_MOE_SLOT_BOOTSTRAP_SEED,
     COMMON_MOE_SLOT_BOOTSTRAP_EMPTY,
+    COMMON_MOE_SLOT_BOOTSTRAP_TAIL,
 };
 
 enum common_moe_slot_prefill {

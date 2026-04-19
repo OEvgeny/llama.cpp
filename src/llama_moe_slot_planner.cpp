@@ -46,6 +46,9 @@ struct Config {
 
     // Global slot pool size across all layers.
     int n_global_slots = 1152;
+    bool layer_local_slots = true;
+    int layer_slot_capacity = 0; // 0 = evenly partition slots across layers
+    int layer_slot_stride = 0;   // 0 = use layer_slot_capacity
 
     // How many fills to suggest for the NEXT token after observing current token.
     int max_fills_per_token = 4;
@@ -293,9 +296,24 @@ private:
         const int total_gids = cfg_.n_layers * cfg_.n_experts_per_layer;
         const int n_seed = std::min((int) slot_to_gid_.size(), total_gids);
 
-        for (int gid = 0; gid < n_seed; ++gid) {
-            slot_to_gid_[gid] = gid;
-            gid_to_slot_[gid] = gid;
+        if (!cfg_.layer_local_slots) {
+            for (int gid = 0; gid < n_seed; ++gid) {
+                slot_to_gid_[gid] = gid;
+                gid_to_slot_[gid] = gid;
+            }
+            return;
+        }
+
+        for (int layer = 0; layer < cfg_.n_layers; ++layer) {
+            const int begin = layer_slot_begin(layer);
+            const int end = layer_slot_end(layer);
+            const int n_layer_seed = std::min(cfg_.n_experts_per_layer, std::max(0, end - begin));
+            for (int i = 0; i < n_layer_seed; ++i) {
+                const int slot = begin + i;
+                const int gid = make_gid(layer, i);
+                slot_to_gid_[slot] = gid;
+                gid_to_slot_[gid] = slot;
+            }
         }
     }
 
@@ -394,7 +412,48 @@ private:
         return -1;
     }
 
+    int layer_slot_begin(int layer) const {
+        if (!cfg_.layer_local_slots || cfg_.n_layers <= 0) {
+            return 0;
+        }
+        if (cfg_.layer_slot_capacity > 0) {
+            const int capacity = std::min(cfg_.layer_slot_capacity, std::max(0, cfg_.n_global_slots));
+            if (capacity <= 0) {
+                return 0;
+            }
+            const int stride = cfg_.layer_slot_stride > 0 ? cfg_.layer_slot_stride : capacity;
+            int base = (int) (((int64_t) layer * stride) % std::max(1, cfg_.n_global_slots));
+            if (base + capacity > cfg_.n_global_slots) {
+                base = std::max(0, cfg_.n_global_slots - capacity);
+            }
+            return base;
+        }
+        return (int) ((int64_t) cfg_.n_global_slots * layer / cfg_.n_layers);
+    }
+
+    int layer_slot_end(int layer) const {
+        if (!cfg_.layer_local_slots || cfg_.n_layers <= 0) {
+            return cfg_.n_global_slots;
+        }
+        if (cfg_.layer_slot_capacity > 0) {
+            return std::min(cfg_.n_global_slots, layer_slot_begin(layer) + cfg_.layer_slot_capacity);
+        }
+        return (int) ((int64_t) cfg_.n_global_slots * (layer + 1) / cfg_.n_layers);
+    }
+
+    int first_free_slot_for_layer(const std::vector<int> & slot_to_gid, int layer) const {
+        const int begin = std::max(0, layer_slot_begin(layer));
+        const int end = std::min((int) slot_to_gid.size(), layer_slot_end(layer));
+        for (int slot = begin; slot < end; ++slot) {
+            if (slot_to_gid[slot] < 0) {
+                return slot;
+            }
+        }
+        return -1;
+    }
+
     int choose_victim_gid_with_state(
+            int layer,
             const std::unordered_set<int> & reserved,
             const std::unordered_set<int> & protected_gids,
             const std::vector<int> & temp_slot_to_gid) const {
@@ -402,7 +461,9 @@ private:
         double best = std::numeric_limits<double>::infinity();
 
         for (int pass = 0; pass < 2; ++pass) {
-            for (int slot = 0; slot < (int) temp_slot_to_gid.size(); ++slot) {
+            const int begin = std::max(0, layer_slot_begin(layer));
+            const int end = std::min((int) temp_slot_to_gid.size(), layer_slot_end(layer));
+            for (int slot = begin; slot < end; ++slot) {
                 const int gid = temp_slot_to_gid[slot];
                 if (gid < 0) continue;
                 if (reserved.find(gid) != reserved.end()) continue;
@@ -514,7 +575,7 @@ private:
             fd.score = c.score;
             fd.reason = c.reason;
 
-            int slot = first_free_slot_in(temp_slot_to_gid);
+            int slot = cfg_.layer_local_slots ? first_free_slot_for_layer(temp_slot_to_gid, c.layer) : first_free_slot_in(temp_slot_to_gid);
             if (slot >= 0) {
                 fd.slot = slot;
                 temp_slot_to_gid[slot] = c.gid;
@@ -523,7 +584,7 @@ private:
                 continue;
             }
 
-            const int victim_gid = choose_victim_gid_with_state(reserved_gids, current_selected_gids, temp_slot_to_gid);
+            const int victim_gid = choose_victim_gid_with_state(c.layer, reserved_gids, current_selected_gids, temp_slot_to_gid);
             if (victim_gid < 0) {
                 continue;
             }
