@@ -2393,7 +2393,9 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
-    const ggml_tensor * cond = dst->src[3];
+    const ggml_tensor * slot_src0 = dst->src[4] != nullptr ? dst->src[3] : nullptr;
+    const ggml_tensor * expert_to_slot = dst->src[4];
+    const ggml_tensor * cond = dst->src[4] == nullptr ? dst->src[3] : nullptr;
 
     if (cond != nullptr) {
         GGML_ASSERT(cond->type == GGML_TYPE_F32);
@@ -2423,7 +2425,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             if (ggml_is_quantized(src0->type)) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
-                    ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
+                    if (expert_to_slot != nullptr) {
+                        ggml_cuda_mul_mat_vec_q_slot(ctx, src0, slot_src0, src1, ids, expert_to_slot, dst);
+                    } else {
+                        ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
+                    }
                     return;
                 }
             } else {

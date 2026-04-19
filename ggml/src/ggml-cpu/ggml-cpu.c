@@ -1519,7 +1519,9 @@ static void ggml_compute_forward_mul_mat_id(
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
     const struct ggml_tensor * ids = dst->src[2];
-    const struct ggml_tensor * cond = dst->src[3];
+    const struct ggml_tensor * slot_src0 = dst->src[4] != NULL ? dst->src[3] : NULL;
+    const struct ggml_tensor * expert_to_slot = dst->src[4];
+    const struct ggml_tensor * cond = dst->src[4] == NULL ? dst->src[3] : NULL;
 
     if (cond != NULL) {
         GGML_ASSERT(cond->type == GGML_TYPE_F32);
@@ -1612,6 +1614,54 @@ static void ggml_compute_forward_mul_mat_id(
             }
         }
 #endif
+    }
+
+    ggml_barrier(params->threadpool);
+
+    if (expert_to_slot != NULL) {
+        GGML_ASSERT(slot_src0 != NULL);
+        GGML_ASSERT(slot_src0->type == src0->type);
+        GGML_ASSERT(slot_src0->ne[0] == src0->ne[0]);
+        GGML_ASSERT(slot_src0->ne[1] == src0->ne[1]);
+        GGML_ASSERT(expert_to_slot->type == GGML_TYPE_I32);
+        GGML_ASSERT(expert_to_slot->ne[0] == src0->ne[2]);
+        GGML_ASSERT(ggml_nelements(expert_to_slot) == src0->ne[2]);
+
+        ggml_vec_dot_t const vec_dot = type_traits_cpu[type].vec_dot;
+
+        const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+        const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+        const int32_t * map = (const int32_t *) expert_to_slot->data;
+
+        const int64_t total = ids->ne[1] * n_ids * ne01;
+        for (int64_t flat = ith; flat < total; flat += nth) {
+            const int64_t ir0 = flat % ne01;
+            const int64_t tmp = flat / ne01;
+            const int id = tmp % n_ids;
+            const int64_t i2 = tmp / n_ids;
+
+            const int32_t expert = *(const int32_t *) ((const char *) ids->data + i2*ids->nb[1] + id*ids->nb[0]);
+            GGML_ASSERT(expert >= 0 && expert < n_as);
+
+            const int64_t i11 = id % ne11;
+            const char * src1_col = (const char *) wdata +
+                (src1_cont || src1->type != vec_dot_type
+                ? (i11      + i2*ne11)*row_size
+                : (i11*nb11 + i2*nb12));
+
+            const int32_t slot = map[expert];
+            const struct ggml_tensor * cur_src0 = slot >= 0 ? slot_src0 : src0;
+            const int64_t source_id = slot >= 0 ? slot : expert;
+            GGML_ASSERT(source_id >= 0 && source_id < cur_src0->ne[2]);
+
+            const char * src0_row = (const char *) cur_src0->data + source_id*cur_src0->nb[2] + ir0*cur_src0->nb[1];
+            float * dst_col = (float *) ((char *) dst->data + (id*nb1 + i2*nb2));
+
+            float tmpf;
+            vec_dot(ne00, &tmpf, 0, src0_row, 0, src1_col, 0, 1);
+            dst_col[ir0] = tmpf;
+        }
+        return;
     }
 
     if (ith == 0) {

@@ -358,7 +358,7 @@ extern "C" {
         int32_t moe_slot_stability_window;    // per-layer stability rolling window
         float   moe_slot_stability_threshold; // minimum layer stability to spend moves there
         int32_t moe_slot_protect_recent;      // avoid evicting experts seen in last N decode steps
-        int32_t moe_slot_bootstrap;           // 0 = seed, 1 = empty
+        int32_t moe_slot_bootstrap;           // 0 = seed, 1 = empty, 2 = tail
         int32_t moe_slot_prefill;             // 0 = freeze, 1 = observe
         int32_t moe_slot_log;                 // 0 = off, 1 = plan, 2 = verbose
 
