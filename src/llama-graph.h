@@ -792,13 +792,6 @@ struct llm_graph_context {
               ggml_tensor * ids,
               ggml_tensor * cond) const;
 
-    ggml_tensor * build_mm_id_slot(
-              ggml_tensor * w,
-              ggml_tensor * slots,
-              ggml_tensor * cur,
-              ggml_tensor * ids,
-              ggml_tensor * expert_to_slot) const;
-
     ggml_tensor * build_norm(
              ggml_tensor * cur,
              ggml_tensor * mw,

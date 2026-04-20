@@ -804,11 +804,6 @@ static void apply_moe_slot_plan(
         const llama_moe_plan::TokenPlan & plan) {
     rt.token_counters.moves_applied = 0;
     rt.token_counters.copy_failures = 0;
-    const bool verify_copies = std::getenv("LLAMA_MOE_SLOT_VERIFY_COPIES") != nullptr;
-    std::vector<uint8_t> verify_scratch;
-    if (verify_copies) {
-        verify_scratch.resize(rt.copy_scratch.size());
-    }
 
     for (const auto & fill : plan.fills) {
         if (fill.slot < 0 || fill.slot >= (int) rt.slot_to_gid.size()) {
@@ -876,15 +871,6 @@ static void apply_moe_slot_plan(
 
                 ggml_backend_tensor_get(src_entry.tensor, rt.copy_scratch.data(), src_offset, (size_t) src_entry.single_expert_bytes);
                 ggml_backend_tensor_set(group.slot_bank_tensor, rt.copy_scratch.data(), dst_offset, (size_t) src_entry.single_expert_bytes);
-                if (verify_copies) {
-                    ggml_backend_tensor_get(group.slot_bank_tensor, verify_scratch.data(), dst_offset, (size_t) src_entry.single_expert_bytes);
-                    if (std::memcmp(rt.copy_scratch.data(), verify_scratch.data(), (size_t) src_entry.single_expert_bytes) != 0) {
-                        LLAMA_LOG_WARN("%s: moe slot copy verification failed for layer=%d expert=%d slot=%d group=%s bytes=%" PRIu64 "\n",
-                            __func__, fill.layer, fill.expert, fill.slot, group.family.c_str(), (uint64_t) src_entry.single_expert_bytes);
-                        copy_ok = false;
-                        break;
-                    }
-                }
                 wrote_any = true;
                 bytes_copied += src_entry.single_expert_bytes;
             }

@@ -3304,28 +3304,6 @@ struct ggml_tensor * ggml_mul_mat_id_cond(
     return result;
 }
 
-struct ggml_tensor * ggml_mul_mat_id_slot(
-        struct ggml_context * ctx,
-        struct ggml_tensor  * as,
-        struct ggml_tensor  * slots,
-        struct ggml_tensor  * b,
-        struct ggml_tensor  * ids,
-        struct ggml_tensor  * expert_to_slot) {
-    GGML_ASSERT(slots->type == as->type);
-    GGML_ASSERT(slots->ne[0] == as->ne[0]);
-    GGML_ASSERT(slots->ne[1] == as->ne[1]);
-    GGML_ASSERT(slots->ne[3] == 1);
-    GGML_ASSERT(expert_to_slot->type == GGML_TYPE_I32);
-    GGML_ASSERT(expert_to_slot->ne[0] == as->ne[2]);
-    GGML_ASSERT(ggml_nelements(expert_to_slot) == as->ne[2]);
-
-    struct ggml_tensor * result = ggml_mul_mat_id(ctx, as, b, ids);
-    result->src[3] = slots;
-    result->src[4] = expert_to_slot;
-
-    return result;
-}
-
 // ggml_out_prod
 
 static inline bool ggml_can_out_prod(const struct ggml_tensor * t0, const struct ggml_tensor * t1) {
